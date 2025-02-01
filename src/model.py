@@ -1,5 +1,5 @@
 """
-MLX model integration for AutoSynth using Mistral Small
+MLX model integration for AutoSynth using Phi-3
 """
 
 from typing import Any, List, Optional, Dict
@@ -8,12 +8,12 @@ from langchain_core.callbacks.manager import CallbackManagerForLLMRun
 from langchain_core.language_models.llms import LLM
 from langchain_core.pydantic_v1 import Field, root_validator
 
-class MistralValidator(LLM):
+class PhiValidator(LLM):
     """
-    Custom LLM class for Mistral Small using MLX
+    Custom LLM class for Phi-3 using MLX
     """
     
-    model_path: str = "mlx-community/Mistral-Small-24B-Instruct-2501-4bit"
+    model_path: str = "/Volumes/JMD/models/phi4-4bit"
     max_tokens: int = Field(default=100)
     temperature: float = Field(default=0.1)
     pipeline: Optional[MLXPipeline] = None
@@ -26,7 +26,14 @@ class MistralValidator(LLM):
                 values["model_path"],
                 pipeline_kwargs={
                     "max_tokens": values["max_tokens"],
-                    "temp": values["temperature"]
+                    "temp": values["temperature"],
+                    "model_kwargs": {
+                        "torch_dtype": "bfloat16",
+                        "quantization_config": {
+                            "group_size": 64,
+                            "bits": 4
+                        }
+                    }
                 }
             )
         except Exception as e:
@@ -38,7 +45,7 @@ class MistralValidator(LLM):
     @property
     def _llm_type(self) -> str:
         """Return type of LLM."""
-        return "mistral_mlx"
+        return "phi_mlx"
         
     def _call(
         self,

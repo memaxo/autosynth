@@ -1,92 +1,112 @@
 """
-Collector module for AutoSynth - handles document collection and initial processing
+Document collection and processing module for AutoSynth.
+
+This module handles:
+- Document collection from various sources (web, PDF, text, GitHub)
+- Content processing and chunking
+- Rate limiting and caching
+- Concurrent document loading
 """
 
 import asyncio
 import logging
+import os
 import pickle
 import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Optional, Set
+from typing import Dict, List, Optional, Set, Union
 from urllib.parse import urlparse
+
 import aiohttp
 import bs4
 from langchain.document_loaders import (
     WebBaseLoader, BSHTMLLoader, PyPDFLoader,
     TextLoader, GitLoader
 )
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders.async_html import AsyncHtmlLoader
+from langchain_core.rate_limiters import InMemoryRateLimiter
+from simhash import Simhash
 
-class RateLimiter:
-    """Rate limiting for domain-specific requests"""
-    
-    def __init__(self, rate: float, per: float = 60.0):
-        self.rate = rate
-        self.per = per
-        self.tokens = rate
-        self.last_update = time.time()
-        self.lock = asyncio.Lock()
-        
-    async def acquire(self):
-        """Acquire permission to make request"""
-        async with self.lock:
-            now = time.time()
-            
-            # Replenish tokens
-            time_passed = now - self.last_update
-            self.tokens = min(
-                self.rate,
-                self.tokens + time_passed * (self.rate / self.per)
-            )
-            self.last_update = now
-            
-            # Check if we can make a request
-            if self.tokens >= 1:
-                self.tokens -= 1
-                return True
-                
-            # Calculate wait time
-            wait_time = (1 - self.tokens) * (self.per / self.rate)
-            await asyncio.sleep(wait_time)
-            self.tokens = 0
-            self.last_update = time.time()
-            return True
+from .github import RepoCollector
+
+# Constants
+DEFAULT_CHUNK_SIZE = 1000
+DEFAULT_CHUNK_OVERLAP = 200
+DEFAULT_RATE_LIMIT = 1.0
+DEFAULT_MAX_WORKERS = 5
+DEFAULT_TIMEOUT = 30
+DEFAULT_MAX_TOKENS = 2000
+DEFAULT_MAX_CONCURRENCY = 5
+
+# Configure global rate limiter
+GLOBAL_RATE_LIMITER = InMemoryRateLimiter(
+    requests_per_second=DEFAULT_RATE_LIMIT,
+    check_every_n_seconds=0.1,
+    max_bucket_size=5
+)
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class DocumentMetadata:
+    """Metadata for collected documents."""
+    source_url: str
+    collection_time: float
+    token_count: int
+    fingerprint: int
+    source_type: str = "web"
+    additional_meta: Dict = None
 
 class DocumentLoadError(Exception):
-    """Raised when document loading fails"""
+    """Raised when document loading fails."""
+    pass
+
+class RateLimitError(Exception):
+    """Raised when rate limit is exceeded."""
     pass
 
 class Collector:
-    """Handles document collection and initial processing"""
+    """Document collection and processing manager."""
     
     def __init__(
         self,
         cache_dir: Optional[Path] = None,
-        rate_limit: float = 1.0,
-        chunk_size: int = 1000,
-        chunk_overlap: int = 200
+        rate_limit: float = DEFAULT_RATE_LIMIT,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+        max_workers: int = DEFAULT_MAX_WORKERS
     ):
+        """
+        Initialize collector with configuration.
+        
+        Args:
+            cache_dir: Directory for caching documents
+            rate_limit: Requests per second limit
+            chunk_size: Size of document chunks
+            chunk_overlap: Overlap between chunks
+            max_workers: Maximum concurrent workers
+        """
         self.session: Optional[aiohttp.ClientSession] = None
-        self.rate_limiters: Dict[str, RateLimiter] = {}
         self.cache_dir = cache_dir
         self.default_rate_limit = rate_limit
         
-        # Initialize text splitter
+        # Initialize text splitter with configuration
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             separators=["\n\n", "\n", " ", ""]
         )
         
-        # Setup logging
-        self.logger = logging.getLogger(__name__)
-        
-        # Track processed URLs
+        # Track processed URLs and initialize thread pool
         self.processed_urls: Set[str] = set()
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
         
     async def setup(self):
-        """Initialize HTTP session and cache directory"""
+        """Initialize HTTP session and cache directory."""
         if self.session is None:
             self.session = aiohttp.ClientSession()
             
@@ -95,25 +115,38 @@ class Collector:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             
     async def cleanup(self):
-        """Cleanup resources"""
+        """Cleanup resources."""
         if self.session:
             await self.session.close()
             self.session = None
+        self.executor.shutdown(wait=True)
             
     def _get_domain(self, url: str) -> str:
-        """Extract domain from URL"""
+        """Extract domain from URL."""
         return urlparse(url).netloc
         
     async def _check_rate_limit(self, url: str):
-        """Check and wait for rate limit"""
-        domain = self._get_domain(url)
-        if domain not in self.rate_limiters:
-            self.rate_limiters[domain] = RateLimiter(self.default_rate_limit)
-            
-        await self.rate_limiters[domain].acquire()
+        """
+        Check and wait for rate limit.
         
+        Raises:
+            RateLimitError: If rate limit check fails
+        """
+        try:
+            await GLOBAL_RATE_LIMITER.acquire()
+        except Exception as e:
+            raise RateLimitError(f"Rate limit check failed: {str(e)}")
+            
     async def _check_cache(self, url: str) -> Optional[List[Document]]:
-        """Check if URL content is cached"""
+        """
+        Check if URL content is cached.
+        
+        Args:
+            url: URL to check cache for
+            
+        Returns:
+            Cached documents if available, None otherwise
+        """
         if not self.cache_dir:
             return None
             
@@ -123,13 +156,21 @@ class Collector:
                 with open(cache_file, 'rb') as f:
                     return pickle.load(f)
             except Exception as e:
-                self.logger.warning(f"Cache read failed for {url}: {str(e)}")
+                logger.warning(f"Cache read failed for {url}: {str(e)}")
+                if cache_file.exists():
+                    cache_file.unlink()  # Remove corrupted cache
                 return None
                 
         return None
         
     async def _cache_documents(self, url: str, docs: List[Document]):
-        """Cache documents for URL"""
+        """
+        Cache documents for URL.
+        
+        Args:
+            url: Source URL
+            docs: Documents to cache
+        """
         if not self.cache_dir:
             return
             
@@ -138,54 +179,101 @@ class Collector:
             with open(cache_file, 'wb') as f:
                 pickle.dump(docs, f)
         except Exception as e:
-            self.logger.warning(f"Cache write failed for {url}: {str(e)}")
+            logger.warning(f"Cache write failed for {url}: {str(e)}")
+            if cache_file.exists():
+                cache_file.unlink()
             
-    def _get_loader(self, url: str):
-        """Get appropriate document loader based on URL"""
+    def _get_loader(self, url: str) -> Union[AsyncHtmlLoader, WebBaseLoader, PyPDFLoader, TextLoader, RepoCollector]:
+        """
+        Get appropriate document loader based on URL.
+        
+        Args:
+            url: URL to get loader for
+            
+        Returns:
+            Document loader instance
+        """
         if url.endswith('.pdf'):
             return PyPDFLoader(url)
         elif url.endswith('.txt'):
             return TextLoader(url)
-        elif 'github.com' in url:
-            return GitLoader(
-                clone_url=url,
-                branch="main",
-                file_filter=lambda file_path: file_path.endswith((".py", ".md", ".txt"))
+        elif 'github.com' in url and not url.endswith('.git'):
+            return RepoCollector(
+                github_token=os.getenv('GITHUB_TOKEN'),
+                cache_dir=self.cache_dir
             )
         else:
-            # Default to WebBaseLoader with BS4 config
-            return WebBaseLoader(
-                web_paths=(url,),
-                bs_kwargs=dict(
-                    parse_only=bs4.SoupStrainer(
-                        class_=("content", "article", "main", "post")
-                    )
-                )
-            )
+            return AsyncHtmlLoader(web_path=url)
             
-    async def _load_with_timeout(self, loader, timeout: int) -> List[Document]:
-        """Load documents with timeout"""
+    async def _load_with_timeout(
+        self,
+        loader: Union[AsyncHtmlLoader, WebBaseLoader, PyPDFLoader, TextLoader, RepoCollector],
+        timeout: int
+    ) -> List[Document]:
+        """
+        Load documents with timeout.
+        
+        Args:
+            loader: Document loader instance
+            timeout: Timeout in seconds
+            
+        Returns:
+            List of loaded documents
+            
+        Raises:
+            DocumentLoadError: If loading fails
+            TimeoutError: If loading times out
+        """
         try:
-            # Most LangChain loaders are synchronous, run in thread pool
-            docs = await asyncio.get_event_loop().run_in_executor(
-                None, loader.load
-            )
-            return docs
+            if hasattr(loader, "aload"):
+                return await asyncio.wait_for(loader.aload(), timeout=timeout)
+            else:
+                return await asyncio.get_event_loop().run_in_executor(
+                    self.executor,
+                    loader.load
+                )
             
         except asyncio.TimeoutError:
             raise TimeoutError(f"Document loading timed out after {timeout}s")
         except Exception as e:
             raise DocumentLoadError(f"Failed to load document: {str(e)}")
             
+    def _process_document(self, doc: Document, url: str) -> Document:
+        """
+        Process and enrich document with metadata.
+        
+        Args:
+            doc: Document to process
+            url: Source URL
+            
+        Returns:
+            Processed document
+        """
+        # Compute simhash fingerprint
+        fingerprint = Simhash(doc.page_content).value
+        
+        # Create metadata
+        metadata = DocumentMetadata(
+            source_url=url,
+            collection_time=time.time(),
+            token_count=len(doc.page_content.split()),
+            fingerprint=fingerprint,
+            additional_meta=doc.metadata
+        )
+        
+        # Update document
+        doc.metadata.update(vars(metadata))
+        return doc
+            
     async def collect(
         self,
         url: str,
-        max_tokens: int = 2000,
-        timeout: int = 30,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        timeout: int = DEFAULT_TIMEOUT,
         force_reload: bool = False
     ) -> List[Document]:
         """
-        Collect and process documents from URL
+        Collect and process documents from URL.
         
         Args:
             url: URL to collect from
@@ -195,71 +283,65 @@ class Collector:
             
         Returns:
             List of processed documents
+            
+        Raises:
+            DocumentLoadError: If collection fails
         """
-        # Skip if already processed
         if url in self.processed_urls and not force_reload:
-            self.logger.info(f"Skipping already processed URL: {url}")
+            logger.info(f"Skipping already processed URL: {url}")
             return []
             
-        # Check rate limiting
-        await self._check_rate_limit(url)
-        
-        # Check cache
-        if not force_reload:
-            if cached := await self._check_cache(url):
-                self.logger.info(f"Using cached content for {url}")
-                return cached
-                
-        # Get appropriate loader
-        loader = self._get_loader(url)
-        
         try:
-            # Load documents
-            docs = await self._load_with_timeout(loader, timeout)
+            # Check rate limiting
+            await self._check_rate_limit(url)
+            
+            # Check cache
+            if not force_reload:
+                if cached := await self._check_cache(url):
+                    logger.info(f"Using cached content for {url}")
+                    return cached
+                    
+            # Get appropriate loader
+            loader = self._get_loader(url)
+            
+            # Load and process documents
+            if isinstance(loader, RepoCollector):
+                docs = loader.collect(url)
+            else:
+                docs = await self._load_with_timeout(loader, timeout)
             
             # Split into chunks
             splits = self.text_splitter.split_documents(docs)
             
-            # Filter by token count
-            filtered_splits = []
-            for split in splits:
-                # Simple token count approximation
-                token_count = len(split.page_content.split())
-                if token_count <= max_tokens:
-                    filtered_splits.append(split)
+            # Filter and process documents
+            processed_docs = []
+            for doc in splits:
+                if len(doc.page_content.split()) <= max_tokens:
+                    processed_doc = self._process_document(doc, url)
+                    processed_docs.append(processed_doc)
                     
-            # Update metadata
-            for doc in filtered_splits:
-                doc.metadata.update({
-                    "source_url": url,
-                    "collection_time": time.time(),
-                    "token_count": len(doc.page_content.split())
-                })
-                
             # Cache results
-            await self._cache_documents(url, filtered_splits)
+            await self._cache_documents(url, processed_docs)
             
             # Mark as processed
             self.processed_urls.add(url)
             
-            self.logger.info(
-                f"Collected {len(filtered_splits)} documents from {url}"
-            )
-            return filtered_splits
+            logger.info(f"Collected {len(processed_docs)} documents from {url}")
+            return processed_docs
             
         except Exception as e:
-            self.logger.error(f"Error collecting from {url}: {str(e)}")
-            raise
+            logger.error(f"Failed to collect from {url}: {str(e)}")
+            raise DocumentLoadError(f"Failed to collect from {url}: {str(e)}")
             
     async def collect_batch(
         self,
         urls: List[str],
-        max_tokens: int = 2000,
-        timeout: int = 30,
-        max_concurrency: int = 5
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        timeout: int = DEFAULT_TIMEOUT,
+        max_concurrency: int = DEFAULT_MAX_CONCURRENCY
     ) -> List[Document]:
         """
-        Collect documents from multiple URLs concurrently
+        Collect documents from multiple URLs concurrently.
         
         Args:
             urls: List of URLs to collect from
@@ -277,16 +359,19 @@ class Collector:
                 try:
                     return await self.collect(url, max_tokens, timeout)
                 except Exception as e:
-                    self.logger.error(f"Failed to collect from {url}: {str(e)}")
+                    logger.error(f"Failed to collect from {url}: {str(e)}")
                     return []
                     
         # Collect from all URLs concurrently
         tasks = [collect_with_semaphore(url) for url in urls]
-        results = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         
         # Combine all documents
         all_docs = []
         for docs in results:
-            all_docs.extend(docs)
+            if isinstance(docs, list):
+                all_docs.extend(docs)
+            else:
+                logger.error(f"Batch collection error: {str(docs)}")
             
         return all_docs 
