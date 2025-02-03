@@ -1,320 +1,202 @@
 """
 Document processor module for AutoSynth pipeline.
 
-This module handles document validation, duplicate detection, and quality assessment
-using a combination of structural analysis, semantic similarity, and LLM-based validation.
+This module handles document processing, chunking, and quality assessment
+using the unified DocumentValidator.
 """
 
-import asyncio
-import json
 import logging
 import re
-import time
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-
 from langchain.schema import Document
-from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate, HumanMessagePromptTemplate
-from pydantic import BaseModel, Field
-
-from model import PhiValidator
-from milvus_store import MilvusStore
-from ranking.embeddings import EmbeddingGenerator
+from .validator import DocumentValidator
 
 # Constants
-MIN_ENGLISH_RATIO = 0.5
-PREVIEW_LENGTH = 1000
-DEFAULT_BATCH_SIZE = 5
+DEFAULT_CHUNK_SIZE = 1000
+DEFAULT_CHUNK_OVERLAP = 200
 DEFAULT_MIN_QUALITY = 0.7
 
 logger = logging.getLogger(__name__)
 
-@dataclass
-class ValidationMetrics:
-    """Metrics for document validation"""
-    structure_score: float = 0.0
-    llm_score: float = 0.0
-    similarity_score: Optional[float] = None
-    content_type: str = "unknown"
-    validation_time: float = 0.0
-
-class ValidationResult(BaseModel):
-    """LLM validation result"""
-    is_valid: bool = Field(..., description="Whether document passed validation")
-    reason: str = Field(..., description="Reason for validation result")
-    content_type: str = Field(..., description="Detected content type")
-    quality_score: float = Field(..., description="Quality score between 0 and 1")
-
-class ValidationError(Exception):
-    """Raised when validation fails"""
-    pass
-
-class DocumentValidator:
+class Processor:
     """
-    Document validator for the AutoSynth pipeline.
+    Document processor for content cleaning, chunking, and validation.
     
-    Handles:
-    - Structural validation
-    - Content quality assessment
-    - Duplicate detection
-    - Batch processing
+    Features:
+    - Content cleaning and normalization
+    - Document chunking with overlap
+    - Quality validation via DocumentValidator
+    - Batch processing capabilities
     """
     
     def __init__(
         self,
-        max_tokens: int = 100,
-        temperature: float = 0.1,
-        cache_dir: Optional[Path] = None,
-        similarity_threshold: float = 0.9
+        validator: Optional[DocumentValidator] = None,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        chunk_overlap: int = DEFAULT_CHUNK_OVERLAP
     ):
         """
-        Initialize the document validator.
+        Initialize processor with configuration.
         
         Args:
-            max_tokens: Maximum tokens for LLM validation
-            temperature: Temperature for LLM validation
-            cache_dir: Directory for caching validation results
-            similarity_threshold: Threshold for duplicate detection (0-1)
+            validator: DocumentValidator instance
+            chunk_size: Size of document chunks
+            chunk_overlap: Overlap between chunks
         """
-        self.llm = PhiValidator(max_tokens=max_tokens, temperature=temperature)
-        self.cache_dir = cache_dir
-        self.similarity_threshold = similarity_threshold
+        self.validator = validator or DocumentValidator()
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
         
-        # Initialize stores and generators
-        self.milvus_store = MilvusStore()
-        self.milvus_store.create_index()
-        self.embedding_generator = EmbeddingGenerator('sentence-transformers/all-MiniLM-L6-v2')
+    def _clean_content(self, content: str) -> str:
+        """Clean and normalize document content."""
+        # Remove excessive whitespace
+        content = re.sub(r'\s+', ' ', content)
+        content = re.sub(r'\n\s*\n', '\n\n', content)
         
-        # Setup validation chain
-        self.validation_chain = self._setup_validation_chain()
+        # Remove common noise patterns
+        content = re.sub(r'<!--.*?-->', '', content)
+        content = re.sub(r'<script.*?</script>', '', content)
+        content = re.sub(r'<style.*?</style>', '', content)
         
-    def _setup_validation_chain(self) -> ChatPromptTemplate:
-        """Setup enhanced validation chain with comprehensive criteria."""
-        validation_prompt = ChatPromptTemplate(messages=[
-            SystemMessage(content=(
-                "You are a document validator specializing in content quality assessment. "
-                "Evaluate the content against these criteria:\n"
-                "1. Language Quality:\n"
-                "   - Must be primarily in English (>80% English text)\n"
-                "   - Well-formed sentences and proper grammar\n"
-                "   - Professional or technical writing style\n"
-                "2. Content Quality:\n"
-                "   - Not gibberish or random characters\n"
-                "   - Well-structured and coherent\n"
-                "   - Contains meaningful technical information\n"
-                "   - Appropriate level of detail\n"
-                "3. Topic Relevance:\n"
-                "   - Directly related to the given topic\n"
-                "   - Contains substantive technical information\n"
-                "   - Demonstrates domain expertise\n"
-                "4. Content Type Detection:\n"
-                "   - Code: Contains programming code or scripts\n"
-                "   - Documentation: API docs, technical specs, etc.\n"
-                "   - Tutorial: Step-by-step guides or examples\n"
-                "   - Article: Technical articles or blog posts\n"
-                "   - Reference: Reference materials or specifications"
-            )),
-            HumanMessagePromptTemplate.from_template(
-                "Topic: {topic}\n"
-                "Content Length: {content_length} chars\n"
-                "Content Preview: {content}\n\n"
-                "Evaluate this content's validity and relevance."
-            )
-        ])
+        return content.strip()
         
-        return (
-            validation_prompt 
-            | self.llm 
-            | StrOutputParser()
-            | JsonOutputParser(pydantic_object=ValidationResult)
-        )
+    def _chunk_document(self, doc: Document) -> List[Document]:
+        """Split document into overlapping chunks."""
+        content = doc.page_content
+        chunks = []
         
-    def _check_structure(self, content: str) -> ValidationMetrics:
-        """
-        Perform structural validation with enhanced quality scoring.
+        # Simple chunking by character count
+        start = 0
+        while start < len(content):
+            end = start + self.chunk_size
+            if end > len(content):
+                end = len(content)
+                
+            chunk = content[start:end]
+            chunks.append(Document(
+                page_content=chunk,
+                metadata={
+                    **doc.metadata,
+                    "chunk_start": start,
+                    "chunk_end": end
+                }
+            ))
+            
+            start = end - self.chunk_overlap
+            if start >= len(content):
+                break
+                
+        return chunks
         
-        Args:
-            content: Document content to validate
-            
-        Returns:
-            ValidationMetrics with structure assessment results
-        """
-        if not content.strip():
-            return ValidationMetrics(content_type="empty")
-            
-        # Check English text ratio
-        english_ratio = len(re.findall(r'[a-zA-Z\s]', content)) / len(content)
-        if english_ratio < MIN_ENGLISH_RATIO:
-            return ValidationMetrics(
-                content_type="non_english",
-                structure_score=english_ratio
-            )
-            
-        metrics = ValidationMetrics()
-        
-        # Detect content type and calculate quality score
-        if any(x in content for x in ['def ', 'class ', 'import ', 'function', '{', '}', ';']):
-            metrics.content_type = "code"
-            metrics.structure_score = sum([
-                0.3,  # Base score
-                0.1 if 'def ' in content else 0,
-                0.1 if 'class ' in content else 0,
-                0.1 if any(doc in content for doc in ['"""', "'''"]) else 0
-            ])
-            
-        elif any(x in content for x in ['# ', '## ', '### ']):
-            metrics.content_type = "documentation"
-            metrics.structure_score = sum([
-                0.3,  # Base score
-                0.2 if len(content.split('\n')) > 10 else 0,
-                0.2 if '```' in content else 0
-            ])
-            
-        elif len(content.split('\n')) > 20:
-            metrics.content_type = "article"
-            metrics.structure_score = sum([
-                0.3,  # Base score
-                0.2 if len(content) > 1000 else 0,
-                0.2 if re.search(r'step \d|^\d\.', content.lower()) else 0
-            ])
-            
-        return metrics
-            
-    async def validate_document(
+    async def clean_content(
         self,
         doc: Document,
-        topic: str
-    ) -> Tuple[bool, Dict]:
+        chunk_size: Optional[int] = None,
+        chunk_overlap: Optional[int] = None
+    ) -> Document:
         """
-        Perform comprehensive document validation.
+        Clean document content and optionally chunk it.
+        
+        Args:
+            doc: Document to clean
+            chunk_size: Optional custom chunk size
+            chunk_overlap: Optional custom chunk overlap
+            
+        Returns:
+            Cleaned document or list of chunked documents
+        """
+        # Save original chunk settings
+        orig_size = self.chunk_size
+        orig_overlap = self.chunk_overlap
+        
+        try:
+            if chunk_size is not None:
+                self.chunk_size = chunk_size
+            if chunk_overlap is not None:
+                self.chunk_overlap = chunk_overlap
+                
+            # Clean content
+            clean_content = self._clean_content(doc.page_content)
+            clean_doc = Document(
+                page_content=clean_content,
+                metadata=doc.metadata
+            )
+            
+            # Chunk if size specified
+            if chunk_size:
+                return self._chunk_document(clean_doc)
+                
+            return clean_doc
+            
+        finally:
+            # Restore original settings
+            self.chunk_size = orig_size
+            self.chunk_overlap = orig_overlap
+            
+    async def verify_quality(
+        self,
+        doc: Document,
+        topic: str,
+        min_quality_score: float = DEFAULT_MIN_QUALITY
+    ) -> bool:
+        """
+        Verify document quality using DocumentValidator.
         
         Args:
             doc: Document to validate
             topic: Topic for relevance checking
+            min_quality_score: Minimum quality threshold
             
         Returns:
-            Tuple of (is_valid, metadata)
+            Whether document passed validation
         """
-        start_time = time.time()
-        try:
-            # Structural validation
-            metrics = self._check_structure(doc.page_content)
-            if metrics.structure_score == 0:
-                return False, self._create_metadata(
-                    doc, metrics,
-                    reason=f"Failed structural validation: {metrics.content_type}"
-                )
-
-            # Duplicate detection
-            embedding = await self.embedding_generator.embed_texts(doc.page_content)
-            results = self.milvus_store.search(embedding, limit=3)
-            
-            if results[0]:
-                metrics.similarity_score = float(results[0][0].distance)
-                if metrics.similarity_score > self.similarity_threshold:
-                    return False, self._create_metadata(
-                        doc, metrics,
-                        reason="Document is near-duplicate of existing content"
-                    )
-                
-            # LLM validation
-            validation = await self.validation_chain.ainvoke({
-                "topic": topic,
-                "content": doc.page_content[:PREVIEW_LENGTH],
-                "content_length": len(doc.page_content)
-            })
-            
-            metrics.llm_score = validation.quality_score
-            if not validation.is_valid:
-                return False, self._create_metadata(
-                    doc, metrics,
-                    reason=validation.reason
-                )
-                
-            return True, self._create_metadata(
-                doc, metrics,
-                reason=validation.reason
-            )
-            
-        except Exception as e:
-            logger.error(f"Validation failed: {str(e)}")
-            return False, {
-                "source": doc.metadata.get("source", ""),
-                "reason": f"Validation error: {str(e)}",
-                "quality_score": 0.0,
-                "validated_at": time.time()
-            }
-        finally:
-            metrics.validation_time = time.time() - start_time
-            
-    def _create_metadata(
-        self,
-        doc: Document,
-        metrics: ValidationMetrics,
-        reason: str
-    ) -> Dict:
-        """Create standardized metadata dictionary."""
-        return {
-            "source": doc.metadata.get("source", ""),
-            "content_type": metrics.content_type,
-            "validation_reason": reason,
-            "quality_score": max(metrics.structure_score, metrics.llm_score),
-            "structure_score": metrics.structure_score,
-            "llm_score": metrics.llm_score,
-            "similarity_score": metrics.similarity_score,
-            "validation_time": metrics.validation_time,
-            "validated_at": time.time()
-        }
-            
-    async def validate_batch(
+        is_valid, _ = await self.validator.verify_quality(doc, topic)
+        return is_valid
+        
+    async def process_batch(
         self,
         docs: List[Document],
         topic: str,
-        batch_size: int = DEFAULT_BATCH_SIZE,
-        min_quality_score: float = DEFAULT_MIN_QUALITY
+        chunk_size: Optional[int] = None,
+        chunk_overlap: Optional[int] = None,
+        min_quality_score: float = DEFAULT_MIN_QUALITY,
+        batch_size: int = 5
     ) -> Tuple[List[Document], List[Dict]]:
         """
-        Validate documents in batches with quality filtering.
+        Process and validate a batch of documents.
         
         Args:
-            docs: List of documents to validate
-            topic: Topic for relevance checking
-            batch_size: Size of batches for concurrent processing
-            min_quality_score: Minimum quality score to accept (0-1)
+            docs: Documents to process
+            topic: Topic for validation
+            chunk_size: Optional custom chunk size
+            chunk_overlap: Optional custom chunk overlap
+            min_quality_score: Minimum quality threshold
+            batch_size: Size of validation batches
             
         Returns:
             Tuple of (valid_docs, validation_results)
         """
-        valid_docs = []
-        validation_results = []
-        
-        for i in range(0, len(docs), batch_size):
-            batch = docs[i:i + batch_size]
-            logger.info(f"Validating batch {i//batch_size + 1}")
-            
-            # Process batch concurrently
-            tasks = [self.validate_document(doc, topic) for doc in batch]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            # Filter and process results
-            for doc, result in zip(batch, results):
-                if isinstance(result, Exception):
-                    logger.error(f"Batch validation error: {str(result)}")
-                    continue
-                    
-                is_valid, metadata = result
-                validation_results.append(metadata)
-                
-                if is_valid and metadata["quality_score"] >= min_quality_score:
-                    doc.metadata.update(metadata)
-                    valid_docs.append(doc)
-            
-            logger.info(
-                f"Batch complete: {len(valid_docs)}/{len(batch)} documents valid "
-                f"(quality threshold: {min_quality_score})"
+        # Clean and chunk documents
+        processed_docs = []
+        for doc in docs:
+            clean_doc = await self.clean_content(
+                doc,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap
             )
-            
-        return valid_docs, validation_results 
+            if isinstance(clean_doc, list):
+                processed_docs.extend(clean_doc)
+            else:
+                processed_docs.append(clean_doc)
+                
+        # Validate documents
+        return await self.validator.validate_batch(
+            processed_docs,
+            topic,
+            batch_size=batch_size,
+            min_quality_score=min_quality_score
+        )
+        
+    def get_performance_stats(self) -> Dict[str, Dict[str, float]]:
+        """Get validation performance statistics."""
+        return self.validator.get_performance_stats() 

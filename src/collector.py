@@ -78,7 +78,8 @@ class Collector:
         rate_limit: float = DEFAULT_RATE_LIMIT,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
-        max_workers: int = DEFAULT_MAX_WORKERS
+        max_workers: int = DEFAULT_MAX_WORKERS,
+        simhash_threshold: int = 3  # Number of differing bits to consider similar
     ):
         """
         Initialize collector with configuration.
@@ -89,10 +90,12 @@ class Collector:
             chunk_size: Size of document chunks
             chunk_overlap: Overlap between chunks
             max_workers: Maximum concurrent workers
+            simhash_threshold: Number of differing bits to consider documents similar
         """
         self.session: Optional[aiohttp.ClientSession] = None
         self.cache_dir = cache_dir
         self.default_rate_limit = rate_limit
+        self.simhash_threshold = simhash_threshold
         
         # Initialize text splitter with configuration
         self.text_splitter = RecursiveCharacterTextSplitter(
@@ -101,8 +104,9 @@ class Collector:
             separators=["\n\n", "\n", " ", ""]
         )
         
-        # Track processed URLs and initialize thread pool
+        # Track processed URLs and fingerprints
         self.processed_urls: Set[str] = set()
+        self.document_fingerprints: Set[int] = set()
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         
     async def setup(self):
@@ -238,19 +242,45 @@ class Collector:
         except Exception as e:
             raise DocumentLoadError(f"Failed to load document: {str(e)}")
             
-    def _process_document(self, doc: Document, url: str) -> Document:
+    def _is_similar_simhash(self, fingerprint: int) -> bool:
+        """
+        Check if a document's Simhash fingerprint is similar to any existing ones.
+        Uses hamming distance for comparison.
+        
+        Args:
+            fingerprint: Simhash fingerprint to check
+            
+        Returns:
+            True if similar document exists, False otherwise
+        """
+        for existing in self.document_fingerprints:
+            # Compare hamming distance of fingerprints
+            if bin(fingerprint ^ existing).count('1') <= self.simhash_threshold:
+                return True
+        return False
+
+    def _process_document(self, doc: Document, url: str) -> Optional[Document]:
         """
         Process and enrich document with metadata.
+        Includes first-pass duplicate detection using Simhash.
         
         Args:
             doc: Document to process
             url: Source URL
             
         Returns:
-            Processed document
+            Processed document if unique, None if duplicate
         """
         # Compute simhash fingerprint
         fingerprint = Simhash(doc.page_content).value
+        
+        # Quick duplicate check using Simhash
+        if self._is_similar_simhash(fingerprint):
+            logger.debug(f"Simhash detected duplicate content from {url}")
+            return None
+            
+        # Add fingerprint to tracked set
+        self.document_fingerprints.add(fingerprint)
         
         # Create metadata
         metadata = DocumentMetadata(
@@ -258,6 +288,7 @@ class Collector:
             collection_time=time.time(),
             token_count=len(doc.page_content.split()),
             fingerprint=fingerprint,
+            source_type="web",
             additional_meta=doc.metadata
         )
         
@@ -318,7 +349,8 @@ class Collector:
             for doc in splits:
                 if len(doc.page_content.split()) <= max_tokens:
                     processed_doc = self._process_document(doc, url)
-                    processed_docs.append(processed_doc)
+                    if processed_doc:
+                        processed_docs.append(processed_doc)
                     
             # Cache results
             await self._cache_documents(url, processed_docs)
@@ -341,37 +373,35 @@ class Collector:
         max_concurrency: int = DEFAULT_MAX_CONCURRENCY
     ) -> List[Document]:
         """
-        Collect documents from multiple URLs concurrently.
+        Collect documents from multiple URLs concurrently with shared concurrency limit.
         
         Args:
             urls: List of URLs to collect from
             max_tokens: Maximum tokens per document
             timeout: Timeout in seconds
-            max_concurrency: Maximum concurrent requests
+            max_concurrency: Maximum number of concurrent requests
             
         Returns:
-            List of all collected documents
+            List of collected documents
         """
         semaphore = asyncio.Semaphore(max_concurrency)
-        
-        async def collect_with_semaphore(url: str) -> List[Document]:
+
+        async def _collect_url(url: str) -> List[Document]:
             async with semaphore:
                 try:
                     return await self.collect(url, max_tokens, timeout)
                 except Exception as e:
                     logger.error(f"Failed to collect from {url}: {str(e)}")
                     return []
-                    
-        # Collect from all URLs concurrently
-        tasks = [collect_with_semaphore(url) for url in urls]
+
+        tasks = [_collect_url(url) for url in urls]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Combine all documents
+
         all_docs = []
-        for docs in results:
-            if isinstance(docs, list):
-                all_docs.extend(docs)
+        for r in results:
+            if isinstance(r, list):
+                all_docs.extend(r)
             else:
-                logger.error(f"Batch collection error: {str(docs)}")
-            
+                logger.error(f"Batch collection error: {str(r)}")
+
         return all_docs 

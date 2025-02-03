@@ -10,6 +10,7 @@ import logging
 import re
 from typing import List, Dict, Any
 from langchain.schema import Document
+from .utils.prompts import GENERATION_PROMPT
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -58,18 +59,11 @@ class ContentGenerator(curator.LLM):
         Returns:
             Formatted prompt string for the model
         """
-        return f"""
-        Create a high-quality variation of the following content 
-        while preserving the key information and technical accuracy.
-        Make the content unique and well-structured.
+        return f"""{GENERATION_PROMPT}
 
-        Original Content:
-        {input_doc['content']}
-
-        Generate the variation with this format:
-        <think>Analysis and key points to preserve</think>
-        [Generated variation here]
-        """
+<input>
+{input_doc['content']}
+</input>"""
 
     def parse(self, input_doc: Dict[str, Any], response: str) -> List[Dict[str, Any]]:
         """
@@ -84,35 +78,40 @@ class ContentGenerator(curator.LLM):
             preservation analysis, and metadata
         """
         try:
-            # Extract reasoning section
-            reasoning_match = re.search(
-                r"<think>(.*?)</think>",
+            # Extract analysis section
+            analysis_match = re.search(
+                r"<analysis>(.*?)</analysis>",
                 response,
                 re.DOTALL
             )
-            reasoning = reasoning_match.group(1).strip() if reasoning_match else ""
+            analysis = analysis_match.group(1).strip() if analysis_match else ""
             
-            # Extract generated content
-            content = re.sub(
-                r"<think>.*?</think>",
-                "",
+            # Extract generated variation
+            variation_match = re.search(
+                r"<variation>(.*?)</variation>",
                 response,
-                flags=re.DOTALL
-            ).strip()
+                re.DOTALL
+            )
+            variation = variation_match.group(1).strip() if variation_match else ""
             
-            if not content:
-                logger.warning("Generated content is empty")
-                return []
-
+            # Extract verification
+            verification_match = re.search(
+                r"<verification>(.*?)</verification>",
+                response,
+                re.DOTALL
+            )
+            verification = verification_match.group(1).strip() if verification_match else ""
+            
             return [{
-                "original": input_doc['content'],
-                "generated_content": content,
-                "preservation_analysis": reasoning,
-                "metadata": input_doc.get('metadata', {})
+                "original": input_doc["content"],
+                "generated_content": variation,
+                "preservation_analysis": analysis,
+                "verification": verification,
+                "metadata": input_doc.get("metadata", {})
             }]
             
         except Exception as e:
-            logger.error(f"Failed to parse response: {str(e)}")
+            logger.error(f"Error parsing generation response: {str(e)}")
             return []
 
     async def generate_batch(self, documents: List[Document]) -> List[Dict[str, Any]]:

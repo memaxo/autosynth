@@ -18,16 +18,21 @@ import gradio as gr
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import logging
 
 from .collector import Collector
 from .model import PhiValidator
 from .monitor import Monitor, create_progress_bar
-from .processor import DocumentValidator
+from .processor import DocumentValidator, Processor
 from .providers.brave import BraveAPIWrapper
 from .providers.duckduckgo import DuckDuckGoAPIWrapper
 from .providers.exa import ExaAPIWrapper
 from .providers.tavily import TavilyAPIWrapper
-from .search import ValidatedSearch
+from .search import ValidatedSearch, Search
+from .pipeline import Project
+from .db import ProjectStateDB
+from langchain.schema import Document
+from .generator import ContentGenerator
 
 # Constants
 DEFAULT_CACHE_DIR = Path("./cache")
@@ -94,47 +99,34 @@ def init_components(
 
 # State management
 class AppState:
-    """Manages application state and initialization."""
+    """Manages state for the Gradio interface."""
     
     def __init__(self):
-        self.initialized = False
-        self.cleanup_scheduled = False
-        self.monitor_initialized = False
-        self.last_update = datetime.now()
-        
-        # Data storage
-        self.collected_docs: List[Dict] = []
-        self.validated_docs: List[Dict] = []
-        self.generated_content: List[Dict] = []
-        self.search_results: List[Dict] = []
+        """Initialize app state."""
+        self.project_id: Optional[str] = None
+        self.topic: Optional[str] = None
+        self.base_path: Optional[Path] = None
+        self.project: Optional[Project] = None
+        self.searcher: Optional[Search] = None
+        self.collector: Optional[Collector] = None
+        self.processor: Optional[Processor] = None
+        self.generator: Optional[ContentGenerator] = None
+        self.state_db: Optional[ProjectStateDB] = None
+        self.logger = logging.getLogger("autosynth.gradio")
+
+    def init_project(self, project_id: str, topic: str, base_path: str = "~/.autosynth"):
+        """Initialize or load a project."""
+        self.project_id = project_id
+        self.topic = topic
+        self.base_path = Path(base_path).expanduser()
         
         # Initialize components
-        (
-            self.phi_model,
-            self.validator,
-            self.search_client,
-            self.collector,
-            self.monitor
-        ) = init_components()
-        
-    async def initialize(self):
-        """Initialize components if needed."""
-        if not self.initialized:
-            await self.collector.setup()
-            self.initialized = True
-            
-    async def cleanup(self):
-        """Cleanup components."""
-        if self.initialized:
-            await self.collector.cleanup()
-            await self.validator.cleanup()
-            self.initialized = False
-            
-    async def initialize_monitor(self):
-        """Initialize monitor if needed."""
-        if not self.monitor_initialized:
-            asyncio.create_task(self.monitor.start())
-            self.monitor_initialized = True
+        self.project = Project(project_id, topic, self.base_path)
+        self.searcher = Search()
+        self.collector = Collector()
+        self.processor = Processor()
+        self.generator = ContentGenerator()
+        self.state_db = ProjectStateDB()
 
 # Create global state
 state = AppState()
@@ -396,8 +388,7 @@ def build_search_tab() -> gr.Tab:
         
         # Clear cache button
         async def clear_search_cache():
-            state.search_client.url_cache.clear()
-            await state.search_client.milvus_store.clear()
+            state.search_client.vector_store.clear_all()
             return {
                 "status": "success",
                 "message": "Cache cleared",
@@ -488,174 +479,115 @@ def create_progress_plots() -> Tuple[go.Figure, go.Figure]:
     return progress_fig, metrics_fig
 
 # Processing functionality
-async def collect_documents(
-    file_objs: List[gr.File],
-    urls: str = "",
-    batch_size: int = 5,
-    max_concurrent: int = 3,
-    processing_timeout: float = 30,
-    retry_attempts: int = 1,
-    progress: gr.Progress = gr.Progress()
-) -> Dict[str, Any]:
-    """Collect documents from files and URLs."""
-    await state.initialize()
-    await state.initialize_monitor()
-    
-    # Update monitor stage
-    state.monitor.update_stage_progress(
-        stage="collect",
-        completed=0,
-        total=len(file_objs) + len(urls.split('\n')),
-        status="running"
-    )
-    
-    try:
-        # Process URLs
-        url_list = [url.strip() for url in urls.split('\n') if url.strip()]
-        collected_docs = await state.collector.collect_batch(
-            urls=url_list,
-            max_tokens=2000,
-            timeout=processing_timeout,
-            max_concurrency=max_concurrent
-        )
+async def collect_documents(state: AppState, urls: str, progress=gr.Progress()):
+    """Collect documents from provided URLs."""
+    if not state.collector:
+        return "Error: Project not initialized", {}
         
-        # Process files
-        for file_obj in file_objs:
+    try:
+        # Parse URLs
+        url_list = [url.strip() for url in urls.split("\n") if url.strip()]
+        if not url_list:
+            return "Error: No valid URLs provided", {}
+            
+        # Collect documents
+        collected_docs = []
+        for url in progress.tqdm(url_list, desc="Collecting documents"):
             try:
-                docs = await state.collector.collect(
-                    url=file_obj.name,
+                docs = await state.collector.collect_batch(
+                    url,
                     max_tokens=2000,
-                    timeout=processing_timeout
+                    timeout=30
                 )
                 collected_docs.extend(docs)
             except Exception as e:
-                state.monitor.add_log(f"Failed to process {file_obj.name}: {str(e)}", style="red")
-        
-        # Update state
-        state.collected_docs = collected_docs
-        
-        result = {
-            "status": "success",
-            "collected": len(collected_docs),
-            "errors": []
-        }
-        
-        # Update monitor
-        state.monitor.update_stage_metrics("collect", {
-            "documents_collected": len(collected_docs),
-            "failed_downloads": len(result["errors"])
-        })
-        
-        state.monitor.add_log(
-            f"Collected {len(collected_docs)} documents",
-            style="green"
-        )
-        
-        return result
-        
-    except Exception as e:
-        error_msg = f"Collection failed: {str(e)}"
-        state.monitor.add_log(error_msg, style="red")
-        raise
-
-async def validate_docs(
-    topic: str = "general",
-    batch_size: int = 5,
-    max_concurrent: int = 3,
-    processing_timeout: float = 30,
-    progress: gr.Progress = gr.Progress()
-) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    """Validate collected documents."""
-    await state.initialize_monitor()
-    
-    if not state.collected_docs:
-        return {
-            "status": "error",
-            "message": "No documents to validate"
-        }, []
-    
-    # Update monitor stage
-    state.monitor.update_stage_progress(
-        stage="process",
-        completed=0,
-        total=len(state.collected_docs),
-        status="running"
-    )
-    
-    try:
-        # Process documents in batches
-        validated_docs = []
-        failed_docs = []
-        
-        for i in range(0, len(state.collected_docs), batch_size):
-            batch = state.collected_docs[i:i + batch_size]
-            
-            try:
-                results = await asyncio.gather(*[
-                    state.validator.validate_document(
-                        doc,
-                        topic=topic,
-                        timeout=processing_timeout
-                    )
-                    for doc in batch
-                ], return_exceptions=True)
+                state.logger.error(f"Error collecting from {url}: {str(e)}")
+                continue
                 
-                for doc, result in zip(batch, results):
-                    if isinstance(result, Exception):
-                        failed_docs.append({
-                            "doc_id": doc.metadata.get("doc_id"),
-                            "error": str(result)
-                        })
-                    else:
-                        validated_docs.append(result)
-                        
-            except Exception as e:
-                state.monitor.add_log(f"Batch validation failed: {str(e)}", style="red")
-        
-        # Update state
-        state.validated_docs = validated_docs
-        
-        # Prepare result data
-        result = {
-            "status": "success",
-            "validated": len(validated_docs),
-            "failed": len(failed_docs),
-            "details": {
-                "by_type": {},
-                "by_source": {},
-                "validation_times": []
+        # Store documents
+        for doc in collected_docs:
+            doc_dict = {
+                "content": doc.page_content,
+                "metadata": doc.metadata,
+                "source_type": "web",
+                "tokens": len(doc.page_content.split())
             }
-        }
-        
-        # Create table data
-        table_data = [{
-            "doc_id": doc.metadata.get("doc_id"),
-            "file_name": doc.metadata.get("file_name", "Unknown"),
-            "is_valid": doc.metadata.get("is_valid", False),
-            "content_type": doc.metadata.get("content_type", "Unknown"),
-            "validation_reason": doc.metadata.get("validation_reason", ""),
-            "quality_score": doc.metadata.get("quality_score", 0.0),
-            "source_type": doc.metadata.get("source_type", "unknown")
-        } for doc in validated_docs]
-        
-        # Update monitor
-        state.monitor.update_stage_metrics("process", {
-            "documents_processed": len(validated_docs),
-            "avg_quality_score": sum(d["quality_score"] for d in table_data) / len(table_data) if table_data else 0,
-            "rejected_docs": len(failed_docs)
-        })
-        
-        state.monitor.add_log(
-            f"Validated {len(validated_docs)} documents ({len(failed_docs)} failed)",
-            style="green"
+            state.state_db.add_collected_doc(state.project_id, doc_dict)
+            
+        # Get updated counts
+        doc_count = state.state_db.get_doc_count(state.project_id, "collected")
+        token_count = sum(len(doc.page_content.split()) for doc in collected_docs)
+            
+        return (
+            f"Collected {len(collected_docs)} documents",
+            {
+                "documents_collected": doc_count,
+                "tokens_collected": token_count
+            }
         )
-        
-        return result, table_data
-        
+            
     except Exception as e:
-        error_msg = f"Validation failed: {str(e)}"
-        state.monitor.add_log(error_msg, style="red")
-        raise
+        state.logger.error(f"Error in document collection: {str(e)}")
+        return f"Error: {str(e)}", {}
+
+async def process_documents(state: AppState, batch_size: int = 10, progress=gr.Progress()):
+    """Process collected documents."""
+    if not state.processor:
+        return "Error: Project not initialized", {}
+        
+    try:
+        # Get collected documents
+        collected_docs = state.state_db.get_collected_docs(state.project_id)
+        if not collected_docs:
+            return "Error: No documents to process", {}
+            
+        processed_count = 0
+        total_chunks = 0
+        
+        # Process in batches
+        for i in progress.tqdm(
+            range(0, len(collected_docs), batch_size),
+            desc="Processing documents"
+        ):
+            batch = collected_docs[i:i + batch_size]
+            
+            for doc_dict in batch:
+                try:
+                    doc = Document(
+                        page_content=doc_dict["content"],
+                        metadata=doc_dict["metadata"]
+                    )
+                    
+                    clean_doc = await state.processor.clean_content(
+                        doc,
+                        chunk_size=1000,
+                        chunk_overlap=200
+                    )
+                    
+                    if await state.processor.verify_quality(clean_doc, state.topic):
+                        processed_dict = {
+                            "content": clean_doc.page_content,
+                            "metadata": clean_doc.metadata
+                        }
+                        state.state_db.add_processed_doc(state.project_id, processed_dict)
+                        processed_count += 1
+                        total_chunks += len(clean_doc.page_content.split())
+                        
+                except Exception as e:
+                    state.logger.error(f"Error processing document: {str(e)}")
+                    continue
+                    
+        return (
+            f"Processed {processed_count} documents",
+            {
+                "documents_processed": processed_count,
+                "chunks_created": total_chunks
+            }
+        )
+            
+    except Exception as e:
+        state.logger.error(f"Error in document processing: {str(e)}")
+        return f"Error: {str(e)}", {}
 
 # Generation functionality
 async def generate_content(doc_index: int, prompt: str, temperature: float) -> str:
@@ -845,47 +777,46 @@ def build_processing_tab() -> gr.Tab:
                     label="Topic (for validation)",
                     placeholder="Enter topic for content validation..."
                 )
-                validation_options = gr.CheckboxGroup(
-                    choices=["Strict Mode", "Cache Results"],
-                    label="Validation Options"
-                )
         
-        # Filtering controls
+        # Add filtering controls
         with gr.Row():
-            with gr.Column():
-                validity_filter = gr.Radio(
-                    choices=VALIDITY_FILTERS,
-                    value="All",
-                    label="Validity Filter"
-                )
-                content_type_filter = gr.Dropdown(
-                    choices=CONTENT_TYPES,
-                    value="All",
-                    label="Content Type"
-                )
-            
-            with gr.Column():
-                source_type_filter = gr.Dropdown(
-                    choices=SOURCE_TYPES,
-                    value="All",
-                    label="Source Type"
-                )
-                min_score_filter = gr.Slider(
-                    minimum=0,
-                    maximum=1,
-                    value=0,
-                    label="Minimum Quality Score"
-                )
-        
-        # Visualization components
+            gr.Dropdown(
+                choices=VALIDITY_FILTERS,
+                value="All",
+                label="Validity Filter",
+                interactive=True
+            )
+            gr.Dropdown(
+                choices=CONTENT_TYPES,
+                value="All",
+                label="Content Type",
+                interactive=True
+            )
+            gr.Dropdown(
+                choices=SOURCE_TYPES,
+                value="All",
+                label="Source Type",
+                interactive=True
+            )
+            gr.Slider(
+                minimum=0.0,
+                maximum=1.0,
+                value=0.0,
+                step=0.1,
+                label="Minimum Quality Score",
+                interactive=True
+            )
+
+        # Add progress visualization
         with gr.Row():
-            with gr.Column():
-                type_dist_plot = gr.Plot(label="Content Type Distribution")
-                source_dist_plot = gr.Plot(label="Source Distribution")
-            
-            with gr.Column():
-                time_dist_plot = gr.Plot(label="Validation Times")
-                progress_chart = gr.Plot(label="Processing Progress")
+            gr.Plot(
+                label="Processing Progress",
+                value=create_progress_plots()[0]
+            )
+            gr.Plot(
+                label="Validation Statistics",
+                value=create_progress_plots()[1]
+            )
         
         # Results table
         results_table = gr.DataFrame(
@@ -932,7 +863,7 @@ def build_processing_tab() -> gr.Tab:
         )
         
         validate_btn.click(
-            fn=validate_docs,
+            fn=process_documents,
             inputs=[
                 topic_input,
                 batch_size,
@@ -942,63 +873,9 @@ def build_processing_tab() -> gr.Tab:
             outputs=[
                 validation_status,
                 results_table,
-                type_dist_plot,
-                source_dist_plot,
-                time_dist_plot
+                stats_plot
             ]
         )
-        
-        # Add filtering
-        def update_filtered_results(
-            table_data: List[Dict],
-            validity: str,
-            content_type: str,
-            source_type: str,
-            min_score: float
-        ) -> gr.DataFrame:
-            """Filter validation results."""
-            filters = {
-                "validity": validity,
-                "content_type": content_type,
-                "source_type": source_type,
-                "min_score": min_score
-            }
-            
-            filtered = table_data.copy()
-            
-            if filters["validity"] != "All":
-                is_valid = filters["validity"] == "Valid Only"
-                filtered = [r for r in filtered if r["is_valid"] == is_valid]
-            
-            if filters["content_type"] != "All":
-                filtered = [r for r in filtered if r["content_type"] == filters["content_type"]]
-            
-            if filters["source_type"] != "All":
-                filtered = [r for r in filtered if r["source_type"] == filters["source_type"]]
-            
-            if filters["min_score"] > 0:
-                filtered = [r for r in filtered if r["quality_score"] >= filters["min_score"]]
-            
-            return filtered
-        
-        # Connect filtering controls
-        for filter_control in [
-            validity_filter,
-            content_type_filter,
-            source_type_filter,
-            min_score_filter
-        ]:
-            filter_control.change(
-                fn=update_filtered_results,
-                inputs=[
-                    results_table,
-                    validity_filter,
-                    content_type_filter,
-                    source_type_filter,
-                    min_score_filter
-                ],
-                outputs=results_table
-            )
     
     return tab
 
@@ -1098,13 +975,99 @@ def build_monitoring_tab() -> gr.Tab:
 def build_interface() -> gr.Blocks:
     """Build complete Gradio interface."""
     with gr.Blocks(title="AutoSynth") as demo:
-        # Add all tabs
-        search_tab = build_search_tab()
-        ranking_tab = build_ranking_tab()
-        processing_tab = build_processing_tab()
-        generation_tab = build_generation_tab()
-        monitoring_tab = build_monitoring_tab()
+        gr.Markdown("# AutoSynth")
+        gr.Markdown("An AI-powered document synthesis and content generation pipeline.")
         
+        # Create tabs container
+        tabs = gr.Tabs(selected=0)  # Start with first tab selected
+        
+        # Add all tabs within the container
+        with tabs:
+            # Search tab for discovering and collecting documents
+            with gr.TabItem("Search"):
+                build_search_tab()
+            
+            # Ranking tab for re-ranking and filtering results
+            with gr.TabItem("Ranking"):
+                build_ranking_tab()
+            
+            # Processing tab for document validation and analysis
+            with gr.TabItem("Processing"):
+                build_processing_tab()
+            
+            # Generation tab for content synthesis
+            with gr.TabItem("Generation"):
+                build_generation_tab()
+            
+            # Monitoring tab for pipeline progress and metrics
+            with gr.TabItem("Monitoring"):
+                build_monitoring_tab()
+        
+        # Add footer with version and status
+        with gr.Row():
+            gr.Markdown("AutoSynth v1.0.0 | Status: ")
+            status_indicator = gr.Markdown(
+                value="Ready",
+                elem_classes=["status-indicator"]
+            )
+        
+        # Update status indicator based on state
+        def update_status():
+            if state.initialized:
+                return "Running"
+            return "Ready"
+        
+        demo.load(
+            fn=update_status,
+            inputs=None,
+            outputs=status_indicator,
+            every=5  # Update every 5 seconds
+        )
+        
+        # Add custom CSS for styling
+        demo.style("""
+            .status-indicator {
+                display: inline-block;
+                padding: 4px 8px;
+                border-radius: 4px;
+                background-color: #e0e0e0;
+                color: #333;
+            }
+            
+            .status-indicator:contains("Running") {
+                background-color: #4CAF50;
+                color: white;
+            }
+            
+            /* Add tab styling */
+            .tabs {
+                margin-top: 1rem;
+                margin-bottom: 1rem;
+            }
+            
+            .tab-nav {
+                border-bottom: 2px solid #eee;
+                padding-bottom: 0.5rem;
+            }
+            
+            .tab-nav button {
+                margin-right: 1rem;
+                padding: 0.5rem 1rem;
+                border: none;
+                background: none;
+                cursor: pointer;
+            }
+            
+            .tab-nav button.selected {
+                border-bottom: 2px solid #2196F3;
+                color: #2196F3;
+            }
+            
+            .tab-content {
+                padding: 1rem 0;
+            }
+        """)
+    
     return demo
 
 def main():

@@ -4,6 +4,7 @@ from unittest.mock import patch, MagicMock
 import os
 import tempfile
 import pickle
+from pathlib import Path
 
 from autosynth.generator import ContentGenerator
 from autosynth.pipeline import AutoSynth, Project
@@ -134,3 +135,104 @@ async def test_pipeline_run_stage_e2e():
 
         # Confirm pipeline updated
         assert project.state.last_stage == "generate"
+
+@pytest.mark.asyncio
+async def test_generator_batch():
+    """Test batch generation of variations."""
+    project = Project("test", "python", Path("test_data"))
+    
+    # Create test documents
+    docs = [
+        Document(page_content="Test content 1", metadata={"source": "test1"}),
+        Document(page_content="Test content 2", metadata={"source": "test2"})
+    ]
+    
+    # Add test documents to database
+    for doc in docs:
+        project.state_db.add_processed_doc(
+            project.project_id,
+            {
+                "content": doc.page_content,
+                "metadata": doc.metadata
+            }
+        )
+    
+    # Run generation
+    await project._run_generate(5)
+    
+    # Check results
+    generated_docs = project.state.get_generated_docs(project.state_db)
+    assert len(generated_docs) == 5
+    
+    # Verify content
+    for doc in generated_docs:
+        assert isinstance(doc["content"], str)
+        assert len(doc["content"]) > 0
+        assert "original" in doc
+        assert "analysis" in doc
+        assert "metadata" in doc
+
+@pytest.mark.asyncio
+async def test_generator_with_invalid_docs():
+    """Test generation with some invalid documents."""
+    project = Project("test2", "python", Path("test_data"))
+    
+    # Create test documents (some invalid)
+    docs = [
+        Document(page_content="Valid content", metadata={"source": "test1"}),
+        Document(page_content="", metadata={"source": "test2"}),  # Invalid
+        Document(page_content="Another valid", metadata={"source": "test3"})
+    ]
+    
+    # Add test documents to database
+    for doc in docs:
+        project.state_db.add_processed_doc(
+            project.project_id,
+            {
+                "content": doc.page_content,
+                "metadata": doc.metadata
+            }
+        )
+    
+    # Run generation
+    await project._run_generate(3)
+    
+    # Check results
+    generated_docs = project.state.get_generated_docs(project.state_db)
+    assert len(generated_docs) == 3
+    
+    # Verify content
+    for doc in generated_docs:
+        assert len(doc["content"]) > 0
+
+@pytest.mark.asyncio
+async def test_full_pipeline():
+    """Test the complete pipeline flow."""
+    project = Project("test3", "python testing", Path("test_data"))
+    
+    # Test URLs
+    test_urls = [
+        "https://example.com/test1",
+        "https://example.com/test2"
+    ]
+    project.state.discovered_urls = test_urls
+    
+    # Run collection
+    await project._run_collect(1000)
+    collected_docs = project.state.get_collected_docs(project.state_db)
+    assert len(collected_docs) == 2, "Should have collected from both URLs"
+    
+    # Run processing
+    await project._run_process(5)
+    processed_docs = project.state.get_processed_docs(project.state_db)
+    assert len(processed_docs) == 2
+    
+    # Run generation
+    await project._run_generate(2)
+    generated_docs = project.state.get_generated_docs(project.state_db)
+    assert len(generated_docs) == 2
+    
+    # Verify metrics were updated
+    assert project.state.metrics.current_tokens > 0
+    assert project.state.metrics.current_chunks > 0
+    assert project.state.metrics.current_variations > 0
