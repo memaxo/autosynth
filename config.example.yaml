@@ -1,0 +1,96 @@
+<![CDATA[
+API_CONFIG:
+  BRAVE_API_KEY: "your_brave_api_key"
+  EXA_API_KEY: "your_exa_api_key"
+  TAVILY_API_KEY: "your_tavily_api_key"
+  GOOGLE_API_KEY: "your_google_api_key"
+  GOOGLE_CSE_ID: "your_google_cse_id"
+  GITHUB_TOKEN: "your_github_token"
+
+RATE_LIMIT_CONFIG:
+  REQUESTS_PER_SECOND: 1.0
+  MAX_BUCKET_SIZE: 5
+  DEFAULT_RATE_LIMIT: 1.0
+
+DEFAULT_PARAMS:
+  CHUNK_SIZE: 1000
+  CHUNK_OVERLAP: 200
+  MAX_TIMEOUT: 30
+  MAX_TOKENS: 2000
+  MAX_WORKERS: 5
+  MAX_CONCURRENCY: 5
+  EMBEDDING_BATCH_SIZE: 32
+  MAX_TEXT_LENGTH: 512
+  EMBEDDING_DIMENSION: 128
+  SIMHASH_THRESHOLD: 3
+  CACHE_SIZE: 10000
+  MIN_ENGLISH_RATIO: 0.5
+  PREVIEW_LENGTH: 1000
+  DEFAULT_MIN_QUALITY: 0.7
+  DEFAULT_BATCH_SIZE: 5
+
+PATH_CONFIG:
+  DB_DIR: "~/.autosynth/db"
+  CACHE_DIR: "./cache"
+  PROJECT_DIR: "./"
+
+MODEL_CONFIG:
+  MODEL_PATH: "/Volumes/JMD/models/phi4-4bit"
+  MAX_TOKENS: 100
+  TEMPERATURE: 0.1
+
+PIPELINE_CONFIG:
+  DISCOVER:
+    web_batch_size: 50
+    github_batch_size: 20
+    min_quality_score: 0.7
+  COLLECT:
+    max_tokens_per_doc: 2000
+    timeout: 30
+    github_max_files: 10
+  PROCESS:
+    chunk_size: 1000
+    overlap: 200
+  GENERATE:
+    batch_size: 5
+    max_retries: 3
+
+SEARCH_CONFIG:
+  ENABLED_PROVIDERS: ["google", "duckduckgo", "exa", "brave", "tavily"]
+  DEFAULT_PROVIDER: "google"
+  FALLBACK_PROVIDERS: ["google"]
+  MAX_RESULTS_PER_PROVIDER: 10
+  MAX_CACHE_AGE_HOURS: 24
+  DEFAULT_NUM_RESULTS: 10
+  POSITION_WEIGHT: 2.0
+  ACADEMIC_BOOST: 1.25
+  MIN_QUALITY_SCORE: 0.7
+
+VALIDATOR_CONFIG:
+  MAX_RECENT_FINGERPRINTS: 1000
+  ACADEMIC_PATTERNS:
+    arxiv: "arxiv\\.org/abs/\\d+\\.\\d+"
+    doi: "\\b10\\.\\d{4,9}/[-._;()/:A-Z0-9]+\\b"
+    academic_keywords: "\\b(thesis|dissertation|journal|conference|proceedings|research|study)\\b"
+    citations: "\\[\\d+\\]|\\(\\w+\\s+et\\s+al\\.,\\s+\\d{4}\\)"
+  ACADEMIC_DOMAINS:
+    - "arxiv.org"
+    - "github.com"
+    - "*.edu"
+    - "*.ac.*"
+    - "scholar.google.com"
+    - "semanticscholar.org"
+  BLOCKED_URL_PATTERNS:
+    - "/ads/"
+    - "/tracking/"
+    - "/analytics/"
+    - "/sponsored/"
+    - "/advertisement/"
+  PREFERRED_URL_PATTERNS:
+    - "/paper/"
+    - "/article/"
+    - "/research/"
+    - "/publication/"
+    - "/doc/"
+    - "/pdf/"
+]]>

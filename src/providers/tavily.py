@@ -19,6 +19,7 @@ import asyncio
 from typing import List, Dict, Optional
 
 from .base import BaseProvider
+from .provider_mixin import ProviderMixin
 from . import register_provider
 from langchain_core.rate_limiters import InMemoryRateLimiter
 
@@ -34,7 +35,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-class TavilySearchAPIWrapper(BaseProvider):
+class TavilySearchAPIWrapper(ProviderMixin, BaseProvider):
     """
     Provider wrapper for accessing the Tavily Search API through LangChain.
 
@@ -53,6 +54,7 @@ class TavilySearchAPIWrapper(BaseProvider):
         include_domains: Optional[List[str]] = None,
         exclude_domains: Optional[List[str]] = None,
         search_kwargs: Optional[Dict] = None,
+        rate_limiter: Optional[InMemoryRateLimiter] = None
     ):
         """
         Initialize the TavilySearchAPIWrapper.
@@ -87,7 +89,7 @@ class TavilySearchAPIWrapper(BaseProvider):
         )
 
         # Initialize rate limiter
-        self.rate_limiter = InMemoryRateLimiter(requests_per_second=1, max_bucket_size=5)
+        self.rate_limiter = rate_limiter or InMemoryRateLimiter(requests_per_second=1, max_bucket_size=5)
 
     async def results(self, query: str, num_results: int = 10) -> List[Dict]:
         """
@@ -112,7 +114,7 @@ class TavilySearchAPIWrapper(BaseProvider):
             self.tool.max_results = num_results
 
             # Rate limiting
-            await self.rate_limiter.acquire()
+            await self._acquire_rate_limit()
 
             # Execute search with the tool in a thread
             response = await asyncio.to_thread(self.tool.invoke, {"query": query})
@@ -140,8 +142,7 @@ class TavilySearchAPIWrapper(BaseProvider):
             return results
 
         except Exception as e:
-            logger.error(f"TavilySearch API error for query '{query}': {e}")
-            raise
+            self._handle_error(e, query)
 
 # Register Tavily provider
 register_provider("tavily", TavilySearchAPIWrapper)

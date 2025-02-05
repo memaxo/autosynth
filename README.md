@@ -82,6 +82,10 @@ autosynth --project-id abc123 --stage discover --target-urls 200
 - PyPDF2: PDF processing
 - gitpython: Git repository handling
 
+## Configuration
+
+AutoSynth uses a centralized configuration module located at `src/config.py` to manage all global settings such as API keys, rate limits, default parameters, file paths, and model parameters. These settings can be overridden externally by providing a `config.yaml` file at runtime. An example configuration file is provided as `config.example.yaml`. Please refer to that file for the expected format and available options.
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.

@@ -48,19 +48,21 @@ class GenerateStage:
                             project.state_db.add_generated_doc(project.project_id, doc_dict)
                             generated_count += 1
 
-                        project.update_metrics(
+                        await project.update_metrics(
                             "variations",
                             generated_count,
                             target_variations
                         )
                         break  # Successful generation
-
                     except Exception as e:
                         self.logger.error(f"Error in batch generation (attempt {retry + 1}): {str(e)}")
                         if retry < config["max_retries"] - 1:
                             await asyncio.sleep(2 ** retry)
                         else:
                             self.logger.error(f"Failed to generate batch after {config['max_retries']} retries")
+                            raise Exception(f"Batch generation failed after {config['max_retries']} retries")
+                if generated_count >= target_variations:
+                    break
 
         finally:
             project.state.last_stage = "generate"

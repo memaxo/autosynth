@@ -363,8 +363,14 @@ def build_search_tab() -> gr.Tab:
                 provider_stats = gr.Plot(label="Provider Statistics")
         
         # Connect components
-        def handle_search(query, providers, n):
-            results, metrics = asyncio.run(search_query(query, providers, n))
+        async def handle_search(query, providers, n):
+            if not query.strip():
+                return {
+                    results_table: [],
+                    search_metrics: {"status": "error", "message": "Empty query provided", "metrics": {}},
+                    provider_stats: None
+                }
+            results, metrics = await search_query(query, providers, n)
             filtered_results = filter_results(results, result_filters.value)
             stats_plot = create_provider_stats_plot(results)
             return {
@@ -395,8 +401,11 @@ def build_search_tab() -> gr.Tab:
                 "metrics": state.search_client.get_stats()
             }
         
+        async def clear_search_cache_wrapper():
+            return await clear_search_cache()
+        
         clear_cache_btn.click(
-            fn=lambda: asyncio.run(clear_search_cache()),
+            fn=clear_search_cache_wrapper,
             inputs=[],
             outputs=[search_metrics]
         )
@@ -911,12 +920,11 @@ def build_generation_tab() -> gr.Tab:
         
         generate_btn = gr.Button("Generate")
         
-        def sync_generate_content(idx: int, prompt: str, temp: float) -> str:
-            """Synchronous wrapper for content generation."""
-            return asyncio.run(generate_content(idx, prompt, temp))
+        async def generate_content_wrapper(idx: int, prompt: str, temp: float) -> str:
+            return await generate_content(idx, prompt, temp)
         
         generate_btn.click(
-            fn=sync_generate_content,
+            fn=generate_content_wrapper,
             inputs=[doc_index, prompt_box, temp_slider],
             outputs=gen_output
         )

@@ -19,6 +19,7 @@ import asyncio
 from typing import List, Dict, Optional
 
 from .base import BaseProvider
+from .provider_mixin import ProviderMixin
 from . import register_provider
 from langchain_core.rate_limiters import InMemoryRateLimiter
 
@@ -31,7 +32,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-class BraveSearchAPIWrapper(BaseProvider):
+class BraveSearchAPIWrapper(ProviderMixin, BaseProvider):
     """
     Provider wrapper for querying the Brave Search API through LangChain.
     
@@ -40,7 +41,7 @@ class BraveSearchAPIWrapper(BaseProvider):
         search_kwargs (dict): Optional configuration parameters for search queries.
     """
 
-    def __init__(self, api_key: Optional[str] = None, search_kwargs: Optional[Dict] = None):
+    def __init__(self, api_key: Optional[str] = None, search_kwargs: Optional[Dict] = None, rate_limiter: Optional[InMemoryRateLimiter] = None):
         """
         Initialize the BraveSearchAPIWrapper.
 
@@ -62,7 +63,7 @@ class BraveSearchAPIWrapper(BaseProvider):
         )
 
         # Initialize rate limiter for this provider
-        self.rate_limiter = InMemoryRateLimiter(requests_per_second=1, max_bucket_size=5)
+        self.rate_limiter = rate_limiter or InMemoryRateLimiter(requests_per_second=1, max_bucket_size=5)
 
     async def results(self, query: str, num_results: int = 10) -> List[Dict]:
         """
@@ -86,8 +87,8 @@ class BraveSearchAPIWrapper(BaseProvider):
             # Update search parameters with num_results
             self.tool.search_kwargs.update({"count": num_results})
             
-            # Rate limiting
-            await self.rate_limiter.acquire()
+            # Rate limiting using mixin method
+            await self._acquire_rate_limit()
 
             # Execute the search query using the tool in a thread
             raw_results = await asyncio.to_thread(self.tool.run, query)
@@ -112,8 +113,7 @@ class BraveSearchAPIWrapper(BaseProvider):
             return results
 
         except Exception as e:
-            logger.error(f"BraveSearch API error for query '{query}': {e}")
-            raise
+            self._handle_error(e, query)
 
 # Register Brave provider
 register_provider("brave", BraveSearchAPIWrapper)

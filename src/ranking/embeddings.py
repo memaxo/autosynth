@@ -7,6 +7,7 @@ from functools import lru_cache
 from simhash import Simhash
 import sqlite3
 from pathlib import Path
+import threading
 
 EMBEDDING_BATCH_SIZE = 32
 MAX_TEXT_LENGTH = 512  # MLX default max length
@@ -23,7 +24,12 @@ class EmbeddingGenerator:
     def __init__(
         self,
         model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-        cache_dir: Optional[Path] = None
+        cache_dir: Optional[Path] = None,
+        embedding_batch_size: int = 32,
+        max_text_length: int = 512,
+        embedding_dimension: int = 128,
+        simhash_threshold: int = 3,
+        cache_size: int = 10000
     ):
         """
         Initialize the optimized embedding generator.
@@ -35,11 +41,17 @@ class EmbeddingGenerator:
         self.model, self.tokenizer = load(model_name)
         self.model_name = model_name
         self.cache_dir = cache_dir
+        self.embedding_batch_size = embedding_batch_size
+        self.max_text_length = max_text_length
+        self.embedding_dimension = embedding_dimension
+        self.simhash_threshold = simhash_threshold
+        self.cache_size = cache_size
         
         if cache_dir:
             self.cache_dir = Path(cache_dir)
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             self._init_cache_db()
+            self._cache_lock = threading.Lock()
 
     def _init_cache_db(self):
         """Initialize SQLite cache database."""
@@ -66,12 +78,12 @@ class EmbeddingGenerator:
 
     def _is_potentially_similar(self, hash1: int, hash2: int) -> bool:
         """Quick check if two texts might be similar using MinHash."""
-        return bin(hash1 ^ hash2).count('1') <= SIMHASH_THRESHOLD
+        return bin(hash1 ^ hash2).count('1') <= self.simhash_threshold
 
     def _normalize_text(self, text: str) -> str:
         """Normalize text by cleaning whitespace and truncating."""
         text = ' '.join(text.split())
-        words = text.split()[:MAX_TEXT_LENGTH]
+        words = text.split()[:self.max_text_length]
         return ' '.join(words)
 
     def _get_cached_embedding(self, text_hash: str) -> Optional[np.ndarray]:
@@ -80,13 +92,14 @@ class EmbeddingGenerator:
             return None
             
         try:
+        with self._cache_lock:
             conn = sqlite3.connect(str(self.cache_dir / "embeddings_cache.db"))
             with conn:
                 result = conn.execute(
                     "SELECT embedding FROM embeddings_cache WHERE text_hash = ?",
                     (text_hash,)
                 ).fetchone()
-                
+            conn.close()
             if result:
                 return np.frombuffer(result[0], dtype=np.float32)
             return None
@@ -99,12 +112,14 @@ class EmbeddingGenerator:
             return
             
         try:
-            conn = sqlite3.connect(str(self.cache_dir / "embeddings_cache.db"))
-            with conn:
-                conn.execute(
-                    "INSERT OR REPLACE INTO embeddings_cache (text_hash, fingerprint, embedding) VALUES (?, ?, ?)",
-                    (text_hash, int(fingerprint), embedding.tobytes())
-                )
+            with self._cache_lock:
+                conn = sqlite3.connect(str(self.cache_dir / "embeddings_cache.db"))
+                with conn:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO embeddings_cache (text_hash, fingerprint, embedding) VALUES (?, ?, ?)",
+                        (text_hash, int(fingerprint), embedding.tobytes())
+                    )
+                conn.close()
         except Exception:
             pass
 
@@ -124,16 +139,20 @@ class EmbeddingGenerator:
         return fingerprint, embedding
 
     async def _generate_embedding(self, text: str) -> np.ndarray:
-        """Generate a single embedding with reduced dimensionality."""
+        """Generate a single embedding with reduced dimensionality using a thread pool."""
+        return await asyncio.to_thread(self._sync_generate_embedding, text)
+
+    def _sync_generate_embedding(self, text: str) -> np.ndarray:
+        """Synchronous embedding generation for use with asyncio.to_thread."""
         input_ids = self.tokenizer.encode(
             text,
             return_tensors="mlx",
             padding=True,
             truncation=True,
-            max_length=MAX_TEXT_LENGTH
+            max_length=self.max_text_length
         )
         outputs = self.model(input_ids)
-        embedding = outputs[0][:, 0, :EMBEDDING_DIMENSION][0]  # Reduce dimensions
+        embedding = outputs[0][:, 0, :self.embedding_dimension][0]  # Reduce dimensions
         return mx.eval(embedding)
 
     async def embed_texts(self, texts: Union[str, List[str]]) -> np.ndarray:

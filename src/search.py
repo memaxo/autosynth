@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 from pathlib import Path
 import json
 
-from providers import PROVIDER_REGISTRY
+from .providers import PROVIDER_REGISTRY
 from .db import AutoSynthDB
 from .utils.hashing import query_hash
 from .validator import DocumentValidator, ValidationMetrics
@@ -49,9 +49,10 @@ class Search:
 
     def __init__(
         self,
+    def __init__(self,
         providers: Optional[Dict] = None,
-        cache_dir: Path = CACHE_DIR,
-        validator: Optional[DocumentValidator] = None
+        validator: Optional[DocumentValidator] = None,
+        db: Optional["AutoSynthDB"] = None
     ):
         """
         Initialize the search system.
@@ -75,10 +76,16 @@ class Search:
         
         # Initialize validator and database
         self.validator = validator or DocumentValidator()
-        self.db = AutoSynthDB(
+        self.db = db if db is not None else AutoSynthDB(
             db_type="cache",
-            base_path=cache_dir
+            base_path=CACHE_DIR
         )
+        self.ranking_weights = {
+            "position": 2.0,
+            "academic_pattern": 0.25,
+            "domain_multiplier": 1.25,
+        }
+        self.quality_threshold = MIN_QUALITY_SCORE
 
     async def _get_cached_results(
         self,
@@ -117,8 +124,7 @@ class Search:
                 (query_hash, provider, results)
                 VALUES (?, ?, ?)
                 """,
-                (hashed_query, provider, json.dumps(results)),
-                in_transaction=True
+                (hashed_query, provider, json.dumps(results))
             )
         except Exception as e:
             logger.error(f"Cache write failed: {str(e)}")
@@ -197,12 +203,12 @@ class Search:
             academic_score = 0.0
             for pattern in ACADEMIC_PATTERNS.values():
                 if re.search(pattern, text):
-                    academic_score += 0.25  # Each pattern adds 0.25
+                    academic_score += self.ranking_weights["academic_pattern"]  # Each pattern adds configured weight
             academic_score = min(1.0, academic_score)
             
             # Domain scoring
             url = result.get("link", "").lower()
-            domain_score = 1.25 if any(
+            domain_score = self.ranking_weights["domain_multiplier"] if any(
                 domain.replace("*.", "") in url
                 for domain in ACADEMIC_DOMAINS
             ) else 1.0
@@ -212,7 +218,7 @@ class Search:
             
             # Combined score with quality weighting
             result["score"] = (
-                position_score * POSITION_WEIGHT +
+                position_score * self.ranking_weights["position"] +
                 term_matches +
                 academic_score
             ) * domain_score * quality_score
@@ -237,7 +243,10 @@ class Search:
         return results
 
     def _get_quality_score(self, result: Dict) -> float:
-        """Calculate quality score using validator metrics."""
+        """Calculate quality score using validator metrics.
+        
+        TODO: Add tests for quality score computation and make thresholds configurable if necessary.
+        """
         # Extract text for validation
         text = (
             result.get("title", "") + "\n" +

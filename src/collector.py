@@ -79,7 +79,9 @@ class Collector:
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
         max_workers: int = DEFAULT_MAX_WORKERS,
-        simhash_threshold: int = 3  # Number of differing bits to consider similar
+        simhash_threshold: int = 3,  # Number of differing bits to consider similar
+        session: Optional[aiohttp.ClientSession] = None,
+        text_splitter: Optional['RecursiveCharacterTextSplitter'] = None
     ):
         """
         Initialize collector with configuration.
@@ -92,13 +94,13 @@ class Collector:
             max_workers: Maximum concurrent workers
             simhash_threshold: Number of differing bits to consider documents similar
         """
-        self.session: Optional[aiohttp.ClientSession] = None
+        self.session: Optional[aiohttp.ClientSession] = session
         self.cache_dir = cache_dir
         self.default_rate_limit = rate_limit
         self.simhash_threshold = simhash_threshold
         
         # Initialize text splitter with configuration
-        self.text_splitter = RecursiveCharacterTextSplitter(
+        self.text_splitter = text_splitter or RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             separators=["\n\n", "\n", " ", ""]
@@ -144,48 +146,49 @@ class Collector:
     async def _check_cache(self, url: str) -> Optional[List[Document]]:
         """
         Check if URL content is cached.
-        
-        Args:
-            url: URL to check cache for
-            
-        Returns:
-            Cached documents if available, None otherwise
         """
         if not self.cache_dir:
             return None
-            
-        cache_file = self.cache_dir / f"{hash(url)}.pkl"
+        cache_file = self.cache_dir / f"{hash(url)}_repo.pkl"
         if cache_file.exists():
             try:
-                with open(cache_file, 'rb') as f:
-                    return pickle.load(f)
+                return await asyncio.to_thread(self._sync_load_cache, cache_file)
             except Exception as e:
-                logger.warning(f"Cache read failed for {url}: {str(e)}")
-                if cache_file.exists():
-                    cache_file.unlink()  # Remove corrupted cache
+                logger.warning(f"Cache read failed for {url}: {e}")
                 return None
-                
         return None
         
+    def _sync_load_cache(self, cache_file: Path) -> List[Document]:
+        import pickle
+        with open(cache_file, "rb") as f:
+            return pickle.load(f)
+
     async def _cache_documents(self, url: str, docs: List[Document]):
         """
         Cache documents for URL.
-        
-        Args:
-            url: Source URL
-            docs: Documents to cache
         """
         if not self.cache_dir:
             return
-            
-        cache_file = self.cache_dir / f"{hash(url)}.pkl"
+        cache_file = self.cache_dir / f"{hash(url)}_repo.pkl"
         try:
-            with open(cache_file, 'wb') as f:
-                pickle.dump(docs, f)
+            await asyncio.to_thread(self._sync_save_cache, cache_file, docs)
         except Exception as e:
-            logger.warning(f"Cache write failed for {url}: {str(e)}")
-            if cache_file.exists():
-                cache_file.unlink()
+            logger.warning(f"Failed to write cache for {url}: {e}")
+        """
+        Cache documents for URL.
+        """
+        if not self.cache_dir:
+    
+        def _sync_save_cache(self, cache_file: Path, docs: List[Document]):
+            import pickle
+            with open(cache_file, "wb") as f:
+                pickle.dump(docs, f)
+            return
+        cache_file = self.cache_dir / f"{hash(url)}_repo.pkl"
+        try:
+            await asyncio.to_thread(self._sync_save_cache, cache_file, docs)
+        except Exception as e:
+            logger.warning(f"Failed to write cache for {url}: {e}")
             
     def _get_loader(self, url: str) -> Union[AsyncHtmlLoader, WebBaseLoader, PyPDFLoader, TextLoader, RepoCollector]:
         """
@@ -341,8 +344,8 @@ class Collector:
             else:
                 docs = await self._load_with_timeout(loader, timeout)
             
-            # Split into chunks
-            splits = self.text_splitter.split_documents(docs)
+            # Split into chunks asynchronously
+            splits = await asyncio.to_thread(self.text_splitter.split_documents, docs)
             
             # Filter and process documents
             processed_docs = []

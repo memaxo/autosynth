@@ -19,36 +19,22 @@ class CollectStage:
         try:
             current_tokens = 0
             web_target = target_tokens // 2
+            seen_urls = set()
 
-            # Web content collection
+        # Web content collection using concurrent tasks
+            tasks = []
             for url in project.state.discovered_urls:
-                if current_tokens >= web_target:
-                    break
-
-                try:
-                    docs = await project.collector.collect(
-                        url,
-                        max_tokens=config["max_tokens_per_doc"],
-                        timeout=config["timeout"]
-                    )
-
-                    for doc in docs:
-                        doc_dict = {
-                            "content": doc.page_content,
-                            "metadata": doc.metadata,
-                            "source_type": "web",
-                            "tokens": len(doc.page_content.split())
-                        }
-
-                        if current_tokens + doc_dict["tokens"] <= web_target:
-                            project.state_db.add_collected_doc(project.project_id, doc_dict)
-                            current_tokens += doc_dict["tokens"]
-
-                    project.update_metrics("tokens", current_tokens, target_tokens)
-
-                except Exception as e:
-                    self.logger.error(f"Error collecting from {url}: {str(e)}")
+                if url in seen_urls:
                     continue
+                seen_urls.add(url)
+                tasks.append(self._collect_url(project, url, config, web_target))
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for tokens in results:
+                if isinstance(tokens, int):
+                    current_tokens += tokens
+                    if current_tokens >= web_target:
+                        break
+            await project.update_metrics("tokens", current_tokens, target_tokens)
 
             # GitHub content collection
             github_target = target_tokens // 2
@@ -86,3 +72,27 @@ class CollectStage:
         finally:
             project.state.last_stage = "collect"
             project.save_state()
+
+    async def _collect_url(self, project, url, config, web_target):
+        try:
+            docs = await project.collector.collect(
+                url,
+                max_tokens=config["max_tokens_per_doc"],
+                timeout=config["timeout"]
+            )
+            tokens_collected = 0
+            for doc in docs:
+                doc_tokens = len(doc.page_content.split())
+                if tokens_collected + doc_tokens <= web_target:
+                    doc_dict = {
+                        "content": doc.page_content,
+                        "metadata": doc.metadata,
+                        "source_type": "web",
+                        "tokens": doc_tokens
+                    }
+                    project.state_db.add_collected_doc(project.project_id, doc_dict)
+                    tokens_collected += doc_tokens
+            return tokens_collected
+        except Exception as e:
+            self.logger.error(f"Error collecting from {url}: {str(e)}")
+            return 0

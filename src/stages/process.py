@@ -18,6 +18,7 @@ class ProcessStage:
 
         try:
             processed_count = 0
+            errors = []
             collected_docs = project.state.get_collected_docs(project.state_db)
 
             for doc_dict in collected_docs:
@@ -35,20 +36,33 @@ class ProcessStage:
                         chunk_size=config["chunk_size"],
                         chunk_overlap=config["overlap"]
                     )
+                    if isinstance(clean_doc, list):
+                        docs_to_verify = clean_doc
+                    else:
+                        docs_to_verify = [clean_doc]
 
-                    if await project.processor.verify_quality(clean_doc, project.topic):
-                        processed_dict = {
-                            "content": clean_doc.page_content,
-                            "metadata": clean_doc.metadata
-                        }
-                        project.state_db.add_processed_doc(project.project_id, processed_dict)
-                        processed_count += 1
-                        project.update_metrics("chunks", processed_count, target_chunks)
+                    verified = False
+                    for d in docs_to_verify:
+                        if await project.processor.verify_quality(d, project.topic):
+                            processed_dict = {
+                                "content": d.page_content,
+                                "metadata": d.metadata
+                            }
+                            project.state_db.add_processed_doc(project.project_id, processed_dict)
+                            processed_count += 1
+                            await project.update_metrics("chunks", processed_count, target_chunks)
+                            verified = True
+                            break
+                    if not verified:
+                        errors.append(f"Document failed quality verification for topic {project.topic}")
 
                 except Exception as e:
                     self.logger.error(f"Error processing document: {str(e)}")
+                    errors.append(str(e))
                     continue
 
+            if errors:
+                self.logger.error(f"Processing encountered errors: {', '.join(errors)}")
         finally:
             project.state.last_stage = "process"
             project.save_state()

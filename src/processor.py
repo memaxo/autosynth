@@ -127,6 +127,24 @@ class Processor:
                 return self._chunk_document(clean_doc)
                 
             return clean_doc
+    
+        async def _process_single_document(
+            self,
+            doc: Document,
+            chunk_size: Optional[int] = None,
+            chunk_overlap: Optional[int] = None
+        ) -> Optional[Document]:
+            """
+            Process a single document by cleaning and chunking it.
+            
+            Returns:
+                Cleaned document, a list of chunks, or None if an error occurs.
+            """
+            try:
+                return await self.clean_content(doc, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+            except Exception as e:
+                logger.error(f"Error cleaning document: {e}")
+                return None
             
         finally:
             # Restore original settings
@@ -163,7 +181,7 @@ class Processor:
         batch_size: int = 5
     ) -> Tuple[List[Document], List[Dict]]:
         """
-        Process and validate a batch of documents.
+        Process and validate a batch of documents concurrently.
         
         Args:
             docs: Documents to process
@@ -176,18 +194,21 @@ class Processor:
         Returns:
             Tuple of (valid_docs, validation_results)
         """
-        # Clean and chunk documents
+        # Process documents concurrently using a helper function
+        results = await asyncio.gather(
+            *[self._process_single_document(doc, chunk_size, chunk_overlap) for doc in docs],
+            return_exceptions=True
+        )
         processed_docs = []
-        for doc in docs:
-            clean_doc = await self.clean_content(
-                doc,
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_overlap
-            )
-            if isinstance(clean_doc, list):
-                processed_docs.extend(clean_doc)
+        for res in results:
+            if isinstance(res, Exception):
+                logger.error(f"Error processing document: {res}")
+            elif res is None:
+                continue
+            elif isinstance(res, list):
+                processed_docs.extend(res)
             else:
-                processed_docs.append(clean_doc)
+                processed_docs.append(res)
                 
         # Validate documents
         return await self.validator.validate_batch(

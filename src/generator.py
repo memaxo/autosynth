@@ -8,6 +8,7 @@ key information and technical accuracy of the original content.
 from bespokelabs import curator
 import logging
 import re
+import json
 from typing import List, Dict, Any
 from langchain.schema import Document
 from .utils.prompts import GENERATION_PROMPT
@@ -17,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class ContentGenerator(curator.LLM):
+    SYSTEM_PROMPT: str = "You are a content generator. Generate high-quality variations with technical accuracy."
     """
     Content generation using DeepSeek-R1 model via Kluster.ai.
     
@@ -49,70 +51,48 @@ class ContentGenerator(curator.LLM):
         )
         logger.info(f"Initialized ContentGenerator with model: {model_name}")
 
-    def prompt(self, input_doc: Dict[str, Any]) -> str:
+    def prompt(self, input_doc: Dict[str, Any]) -> list:
         """
-        Create a prompt for content generation.
+        Create a message-based prompt for content generation.
         
         Args:
-            input_doc: Dictionary containing content and metadata
+            input_doc: Dictionary containing content and metadata. Must include a 'content' key.
             
         Returns:
-            Formatted prompt string for the model
+            A list of messages formatted for the LLM.
         """
-        return f"""{GENERATION_PROMPT}
-
-<input>
-{input_doc['content']}
-</input>"""
+        if "content" not in input_doc or not input_doc["content"]:
+            raise ValueError("Input document must contain a non-empty 'content' key.")
+        return [
+            {"role": "system", "content": self.SYSTEM_PROMPT},
+            {"role": "user", "content": f"{GENERATION_PROMPT}\n{input_doc['content']}"}
+        ]
 
     def parse(self, input_doc: Dict[str, Any], response: str) -> List[Dict[str, Any]]:
         """
-        Parse the LLM response to extract reasoning and generated content.
+        Parse the LLM response (expected in JSON format) to extract generated content.
         
         Args:
             input_doc: Original document dictionary
-            response: Raw response from the model
+            response: Raw JSON response from the model
             
         Returns:
-            List containing parsed response with original content, generated content,
-            preservation analysis, and metadata
+            List containing a dictionary with original content, generated content,
+            preservation analysis, verification, and metadata.
         """
         try:
-            # Extract analysis section
-            analysis_match = re.search(
-                r"<analysis>(.*?)</analysis>",
-                response,
-                re.DOTALL
-            )
-            analysis = analysis_match.group(1).strip() if analysis_match else ""
-            
-            # Extract generated variation
-            variation_match = re.search(
-                r"<variation>(.*?)</variation>",
-                response,
-                re.DOTALL
-            )
-            variation = variation_match.group(1).strip() if variation_match else ""
-            
-            # Extract verification
-            verification_match = re.search(
-                r"<verification>(.*?)</verification>",
-                response,
-                re.DOTALL
-            )
-            verification = verification_match.group(1).strip() if verification_match else ""
-            
+            import json
+            response_data = json.loads(response)
             return [{
                 "original": input_doc["content"],
-                "generated_content": variation,
-                "preservation_analysis": analysis,
-                "verification": verification,
+                "generated_content": response_data.get("variation", ""),
+                "preservation_analysis": response_data.get("analysis", ""),
+                "verification": response_data.get("verification", ""),
                 "metadata": input_doc.get("metadata", {})
             }]
-            
         except Exception as e:
-            logger.error(f"Error parsing generation response: {str(e)}")
-            return []
+            logger.error(f"Error parsing generation response: {e}")
+            raise ValueError(f"Error parsing generation response: {e}")
 
     async def generate_batch(self, documents: List[Document]) -> List[Dict[str, Any]]:
         """
@@ -140,11 +120,14 @@ class ContentGenerator(curator.LLM):
             ]
             
             logger.info(f"Processing batch of {len(documents)} documents")
-            results = self(inputs)  # Curator handles batching
+            results = await asyncio.to_thread(self, inputs)  # Execute generation in a separate thread
             
             if not results:
                 logger.warning("No results generated for batch")
-                
+            else:
+                for idx, item in enumerate(results):
+                    if not isinstance(item, dict) or "generated_content" not in item:
+                        logger.warning(f"Result at index {idx} has an unexpected format: {item}")
             return results
             
         except Exception as e:

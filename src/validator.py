@@ -10,6 +10,8 @@ Features:
 """
 
 import asyncio
+import logging
+logger = logging.getLogger(__name__)
 import re
 import time
 from dataclasses import dataclass
@@ -160,8 +162,7 @@ class DocumentValidator:
         self.embedding_generator = EmbeddingGenerator()
         self.fingerprint_cache = FingerprintCache()
         self.vector_store = AutoSynthDB(
-            db_type=db_type,
-            table_name="validation_embeddings"
+            db_type=db_type
         )
         
         # Performance tracking
@@ -211,6 +212,8 @@ class DocumentValidator:
             )
         ])
         
+        # Note: The bitwise OR (|) operator is used here to compose the validation chain,
+        # as supported by the underlying LLM framework.
         return (
             validation_prompt 
             | self.llm 
@@ -449,7 +452,9 @@ class DocumentValidator:
             min_quality_score: Minimum quality score threshold
             
         Returns:
-            Tuple of (valid_docs, validation_results)
+            Tuple of:
+            - valid_docs: List[Document] of documents that passed validation.
+            - validation_results: List[Dict] containing metadata for each document's validation outcome.
         """
         valid_docs = []
         results = []

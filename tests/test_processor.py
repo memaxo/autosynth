@@ -8,7 +8,8 @@ from autosynth.processor import Processor, DocumentValidator, ValidationResult
 @pytest.mark.asyncio
 async def test_processor_clean_content():
     """Test that clean_content does some form of minimal text processing."""
-    processor = Processor()
+    mock_validator = MagicMock()
+    processor = Processor(validator=mock_validator)
     
     mock_doc = Document(page_content="   Hello <p>World</p>   ", metadata={})
     cleaned_doc = await processor.clean_content(mock_doc, chunk_size=1000, chunk_overlap=100)

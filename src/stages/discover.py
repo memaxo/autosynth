@@ -16,6 +16,9 @@ class DiscoverStage:
         """
         self.logger.info(f"Starting discovery for project {project.project_id}")
         config = project.state.stage_configs["discover"]
+        def save_json(path, data):
+            with open(path, 'w') as f:
+                json.dump(data, f, indent=2)
 
         try:
             # Web search discovery
@@ -31,18 +34,20 @@ class DiscoverStage:
                         project.topic,
                         num_results=batch_size
                     )
-                    new_urls = [r["link"] for r in results if "link" in r]
+                    new_urls = []
+                    for r in results:
+                        if "link" in r and r["link"] not in project.state.discovered_urls:
+                            new_urls.append(r["link"])
                     project.state.discovered_urls.extend(new_urls)
-                    project.update_metrics("urls", len(project.state.discovered_urls), web_target)
+                    await project.update_metrics("urls", len(project.state.discovered_urls), web_target)
 
-                    # Save URLs
+                    # Save URLs asynchronously
                     urls_file = project.get_stage_data_path("discover") / "urls.json"
-                    with open(urls_file, 'w') as f:
-                        json.dump(project.state.discovered_urls, f, indent=2)
+                    await asyncio.to_thread(save_json, urls_file, project.state.discovered_urls)
 
                 except Exception as e:
                     self.logger.error(f"Error in web discovery: {str(e)}")
-                    break
+                    continue
 
             # GitHub repository discovery
             github_target = target_urls // 2
@@ -60,12 +65,11 @@ class DiscoverStage:
                     )
 
                     project.state.github_repos.extend(repos)
-                    project.update_metrics("repos", len(project.state.github_repos), github_target)
+                    await project.update_metrics("repos", len(project.state.github_repos), github_target)
 
-                    # Save repos
+                    # Save repos asynchronously
                     repos_file = project.get_stage_data_path("discover") / "github_repos.json"
-                    with open(repos_file, 'w') as f:
-                        json.dump(project.state.github_repos, f, indent=2)
+                    await asyncio.to_thread(save_json, repos_file, project.state.github_repos)
 
                 except Exception as e:
                     self.logger.error(f"Error in GitHub discovery: {str(e)}")

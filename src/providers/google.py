@@ -22,12 +22,13 @@ from typing import List, Dict, Optional, Any
 from dataclasses import dataclass
 
 from .base import BaseProvider
+from .provider_mixin import ProviderMixin
 from . import register_provider
 from langchain_core.rate_limiters import InMemoryRateLimiter
 
 # Import the Google Search wrapper from LangChain
 try:
-    from langchain_google_community import GoogleSearchAPIWrapper
+    from langchain_google_community import GoogleSearchAPIWrapper as ExternalGoogleSearchAPIWrapper
 except ImportError:
     raise ImportError(
         "Please install langchain-google-community via: "
@@ -77,7 +78,7 @@ class GoogleSearchError(Exception):
         self.original_error = original_error
 
 
-class GoogleSearchAPIWrapper(BaseProvider):
+class GoogleSearchAPIWrapper(ProviderMixin, BaseProvider):
     """
     Enhanced provider wrapper for Google Custom Search API with academic focus.
 
@@ -91,7 +92,8 @@ class GoogleSearchAPIWrapper(BaseProvider):
         self,
         api_key: Optional[str] = None,
         cse_id: Optional[str] = None,
-        search_kwargs: Optional[Dict] = None
+        search_kwargs: Optional[Dict] = None,
+        rate_limiter: Optional[InMemoryRateLimiter] = None
     ):
         """
         Initialize the Google Search API wrapper.
@@ -114,7 +116,7 @@ class GoogleSearchAPIWrapper(BaseProvider):
             )
 
         # Initialize the Google Search wrapper
-        self.search_wrapper = GoogleSearchAPIWrapper(
+        self.search_wrapper = ExternalGoogleSearchAPIWrapper(
             google_api_key=self.api_key,
             google_cse_id=self.cse_id,
             k=10  # Will be updated in results() method
@@ -123,7 +125,7 @@ class GoogleSearchAPIWrapper(BaseProvider):
         self.search_kwargs = search_kwargs or {}
 
         # Initialize rate limiter (100 queries per day free tier)
-        self.rate_limiter = InMemoryRateLimiter(
+        self.rate_limiter = rate_limiter or InMemoryRateLimiter(
             requests_per_second=0.1,  # Max ~8,640 requests per day
             max_bucket_size=5
         )
@@ -227,7 +229,7 @@ class GoogleSearchAPIWrapper(BaseProvider):
             search_params = self._build_search_params(params)
 
             # Rate limiting
-            await self.rate_limiter.acquire()
+            await self._acquire_rate_limit()
 
             # Execute search in thread
             raw_results = await asyncio.to_thread(
@@ -242,9 +244,7 @@ class GoogleSearchAPIWrapper(BaseProvider):
             return results
 
         except Exception as e:
-            error_msg = f"Google Search API error for query '{query}': {str(e)}"
-            logger.error(error_msg)
-            raise GoogleSearchError(error_msg, original_error=e)
+            self._handle_error(e, query)
 
 
 # Register Google Search provider

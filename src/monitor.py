@@ -105,6 +105,8 @@ class Monitor:
         
         # Setup UI layout
         self._setup_layout()
+        self._header_panel = self._render_header()
+        self._stop = False
         
     def _setup_layout(self):
         """Initialize the UI layout structure."""
@@ -308,7 +310,7 @@ class Monitor:
 
     def _render(self) -> Layout:
         """Render the complete UI."""
-        self.layout["header"].update(self._render_header())
+        self.layout["header"].update(self._header_panel)
         self.layout["stages"].update(self._render_stages())
         self.layout["metrics"].update(self._render_metrics())
         self.layout["logs"].update(self._render_logs())
@@ -324,7 +326,7 @@ class Monitor:
                 screen=True,
                 refresh_per_second=4
             ) as live:
-                while True:
+                while not self._stop:
                     live.update(self._render())
                     await asyncio.sleep(0.25)
         except KeyboardInterrupt:
@@ -334,6 +336,10 @@ class Monitor:
         """Manual update of the display."""
         self.console.clear()
         self.console.print(self._render())
+    
+    def stop(self):
+        """Stop the monitor's live update loop."""
+        self._stop = True
 
 def create_progress_bar(description: str = "") -> Progress:
     """Create a styled progress bar."""

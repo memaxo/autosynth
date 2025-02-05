@@ -18,13 +18,13 @@ import asyncio
 from typing import List, Dict, Optional, Literal
 
 from .base import BaseProvider
+from .provider_mixin import ProviderMixin
 from . import register_provider
 from langchain_core.rate_limiters import InMemoryRateLimiter
 
 # Import the DuckDuckGo tools from LangChain community
 try:
-    from langchain_community.tools import DuckDuckGoSearchResults
-    from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
+from langchain_community.utilities import DuckDuckGoSearchAPIWrapper as ExternalDuckDuckGoSearchAPIWrapper
 except ImportError:
     raise ImportError(
         "Please install required packages via: "
@@ -34,7 +34,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-class DuckDuckGoSearchAPIWrapper(BaseProvider):
+class DuckDuckGoProvider(ProviderMixin, BaseProvider):
     """
     Provider wrapper for accessing the DuckDuckGo Search API through LangChain.
 
@@ -54,6 +54,7 @@ class DuckDuckGoSearchAPIWrapper(BaseProvider):
         output_format: Literal["list", "json", "raw"] = "list",
         safesearch: Literal["on", "moderate", "off"] = "moderate",
         max_results: int = 10,
+        rate_limiter: Optional[InMemoryRateLimiter] = None
     ):
         """
         Initialize the DuckDuckGoSearchAPIWrapper.
@@ -67,7 +68,7 @@ class DuckDuckGoSearchAPIWrapper(BaseProvider):
             max_results (int): Maximum number of results. Defaults to 10.
         """
         # Initialize the DuckDuckGo API wrapper with configuration
-        self.api_wrapper = DuckDuckGoSearchAPIWrapper(
+        self.api_wrapper = ExternalDuckDuckGoSearchAPIWrapper(
             region=region,
             time=time,
             max_results=max_results,
@@ -82,7 +83,7 @@ class DuckDuckGoSearchAPIWrapper(BaseProvider):
         )
 
         # Initialize rate limiter
-        self.rate_limiter = InMemoryRateLimiter(requests_per_second=1, max_bucket_size=5)
+        self.rate_limiter = rate_limiter or InMemoryRateLimiter(requests_per_second=1, max_bucket_size=5)
 
     async def results(self, query: str, num_results: int = 10) -> List[Dict]:
         """
@@ -107,7 +108,7 @@ class DuckDuckGoSearchAPIWrapper(BaseProvider):
             self.api_wrapper.max_results = num_results
 
             # Rate limiting
-            await self.rate_limiter.acquire()
+            await self._acquire_rate_limit()
 
             # Execute search with the tool in a thread
             response = await asyncio.to_thread(self.tool.invoke, query)
@@ -148,11 +149,10 @@ class DuckDuckGoSearchAPIWrapper(BaseProvider):
             return results
 
         except Exception as e:
-            logger.error(f"DuckDuckGo Search API error for query '{query}': {e}")
-            raise
+            self._handle_error(e, query)
 
 # Register DuckDuckGo provider
-register_provider("duckduckgo", DuckDuckGoSearchAPIWrapper)
+register_provider("duckduckgo", DuckDuckGoProvider)
 
 # Example usage:
 # if __name__ == "__main__":

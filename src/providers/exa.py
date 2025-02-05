@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from aiohttp import ClientSession, TCPConnector
 
 from .base import BaseProvider
+from .provider_mixin import ProviderMixin
 from . import register_provider
 from langchain_core.rate_limiters import InMemoryRateLimiter
 
@@ -116,7 +117,7 @@ class ExaAPIError(Exception):
         self.original_error = original_error
 
 
-class ExaAPIWrapper(BaseProvider):
+class ExaAPIWrapper(ProviderMixin, BaseProvider):
     """
     Enhanced provider wrapper for querying the Exa Search API with advanced filtering.
 
@@ -130,7 +131,8 @@ class ExaAPIWrapper(BaseProvider):
         self,
         api_key: Optional[str] = None,
         search_kwargs: Optional[Dict] = None,
-        max_connections: int = 10
+        max_connections: int = 10,
+        rate_limiter: Optional[InMemoryRateLimiter] = None
     ):
         """
         Initialize the Exa API wrapper.
@@ -150,7 +152,7 @@ class ExaAPIWrapper(BaseProvider):
         self._max_connections = max_connections
 
         # Initialize rate limiter
-        self.rate_limiter = InMemoryRateLimiter(requests_per_second=1, max_bucket_size=5)
+        self.rate_limiter = rate_limiter or InMemoryRateLimiter(requests_per_second=1, max_bucket_size=5)
 
     async def _get_session(self) -> ClientSession:
         """Get or create aiohttp session with connection pooling."""
@@ -193,7 +195,7 @@ class ExaAPIWrapper(BaseProvider):
     ) -> List[Dict]:
         """Execute search with error handling."""
         try:
-            await self.rate_limiter.acquire()
+            await self._acquire_rate_limit()
             session = await self._get_session()
 
             # Set query in params
@@ -228,9 +230,7 @@ class ExaAPIWrapper(BaseProvider):
             return results
 
         except Exception as e:
-            error_msg = f"Exa API error for query '{query}': {str(e)}"
-            logger.error(error_msg)
-            raise ExaAPIError(error_msg, original_error=e)
+            self._handle_error(e, query)
 
     async def results(
         self,

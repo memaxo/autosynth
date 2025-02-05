@@ -66,23 +66,30 @@ class ProjectState:
     discovered_urls: List[str] = field(default_factory=list)
     github_repos: List[Dict] = field(default_factory=list)
     metrics: ProjectMetrics = field(default_factory=ProjectMetrics)
-
+    
     def get_collected_docs(self, db: ProjectStateDB) -> List[Dict]:
         """Get collected documents from database."""
         return db.get_collected_docs(self.project_id)
-
+    
     def get_processed_docs(self, db: ProjectStateDB) -> List[Dict]:
         """Get processed documents from database."""
         return db.get_processed_docs(self.project_id)
-
+    
     def get_generated_docs(self, db: ProjectStateDB) -> List[Dict]:
         """Get generated documents from database."""
         return db.get_generated_docs(self.project_id)
 
 class Project:
     """Manages state and operations for a single synthetic data project."""
-    
-    def __init__(self, project_id: str, topic: str, base_path: Path):
+class Project:
+    def __init__(self, project_id: str, topic: str, base_path: Path,
+                 *,
+                 searcher: Optional["Search"] = None,
+                 repo_collector: Optional["RepoCollector"] = None,
+                 collector: Optional["Collector"] = None,
+                 processor: Optional["Processor"] = None,
+                 generator: Optional["ContentGenerator"] = None,
+                 state_db: Optional["ProjectStateDB"] = None):
         """
         Initialize project with components and state.
         
@@ -97,20 +104,20 @@ class Project:
         self.project_dir.mkdir(parents=True, exist_ok=True)
 
         # Initialize components
-        self.searcher = Search()
-        self.repo_collector = RepoCollector()
-        self.collector = Collector()
-        self.processor = Processor()
-        self.generator = ContentGenerator()
-
+        self.searcher = searcher if searcher is not None else Search()
+        self.repo_collector = repo_collector if repo_collector is not None else RepoCollector()
+        self.collector = collector if collector is not None else Collector()
+        self.processor = processor if processor is not None else Processor()
+        self.generator = generator if generator is not None else ContentGenerator()
+        self.state_db = state_db if state_db is not None else ProjectStateDB()
         # Initialize state management
         self.state_db = ProjectStateDB()
-        self.state = self._load_or_create_state()
+        self.state = asyncio.run(self._load_or_create_state())
         self.logger = logging.getLogger(f"autosynth.project.{project_id}")
 
-    def _load_or_create_state(self) -> ProjectState:
+    async def _load_or_create_state(self) -> ProjectState:
         """Load existing state or create new one."""
-        project_data = self.state_db.get_project(self.project_id)
+        project_data = await self.state_db.get_project(self.project_id)
         if project_data:
             state = ProjectState()
             state.last_stage = project_data["last_stage"]
@@ -118,37 +125,36 @@ class Project:
             state.stage_configs = project_data["config"]
 
             # Load state data
-            state.discovered_urls = self.state_db.get_urls(self.project_id)
-            state.github_repos = self.state_db.get_github_repos(self.project_id)
+            state.discovered_urls = await self.state_db.get_urls(self.project_id)
+            state.github_repos = await self.state_db.get_github_repos(self.project_id)
 
             # Load metrics
-            metrics = self.state_db.get_metrics(self.project_id)
+            metrics = await self.state_db.get_metrics(self.project_id)
             for name, values in metrics.items():
                 setattr(state.metrics, f"current_{name}", values["current"])
                 setattr(state.metrics, f"target_{name}", values["target"])
 
             return state
 
-        # Create new state
-        self.state_db.create_project(
+        await self.state_db.create_project(
             self.project_id,
             self.topic,
             DEFAULT_CONFIG
         )
         return ProjectState()
 
-    def save_state(self):
+    async def save_state(self):
         """Save current project state."""
-        self.state_db.update_project_state(
+        await self.state_db.update_project_state(
             self.project_id,
             self.state.last_stage
         )
 
         # Save URLs and repos
         if self.state.discovered_urls:
-            self.state_db.add_urls(self.project_id, self.state.discovered_urls)
+            await self.state_db.add_urls(self.project_id, self.state.discovered_urls)
         if self.state.github_repos:
-            self.state_db.add_github_repos(self.project_id, self.state.github_repos)
+            await self.state_db.add_github_repos(self.project_id, self.state.github_repos)
 
         # Save metrics
         metrics = asdict(self.state.metrics)
@@ -156,7 +162,7 @@ class Project:
             current = metrics.get(f"current_{name}", 0)
             target = metrics.get(f"target_{name}", 0)
             if current > 0 or target > 0:
-                self.state_db.update_metrics(self.project_id, name, current, target)
+                await self.state_db.update_metrics(self.project_id, name, current, target)
 
     def get_stage_data_path(self, stage: str) -> Path:
         """Get path for stage-specific data."""
@@ -164,12 +170,11 @@ class Project:
         stage_dir.mkdir(exist_ok=True)
         return stage_dir
 
-    def update_metrics(self, stage: str, current: int, target: int):
-        """Update progress metrics for a stage."""
+    async def update_metrics(self, stage: str, current: int, target: int):
         setattr(self.state.metrics, f"current_{stage}", current)
         setattr(self.state.metrics, f"target_{stage}", target)
-        self.state_db.update_metrics(self.project_id, stage, current, target)
-        self.save_state()
+        await self.state_db.update_metrics(self.project_id, stage, current, target)
+        await self.save_state()
 
 class AutoSynth:
     """Main AutoSynth tool managing multiple projects."""
