@@ -49,7 +49,6 @@ class Search:
 
     def __init__(
         self,
-    def __init__(self,
         providers: Optional[Dict] = None,
         validator: Optional[DocumentValidator] = None,
         db: Optional["AutoSynthDB"] = None
@@ -59,8 +58,8 @@ class Search:
 
         Args:
             providers: Dict mapping provider names to provider instances.
-            cache_dir: Directory for result caching.
             validator: Optional DocumentValidator instance for quality control.
+            db: Optional AutoSynthDB instance for caching.
         """
         # Initialize only enabled providers
         provider_names = providers.keys() if providers else ENABLED_PROVIDERS

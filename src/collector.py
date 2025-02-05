@@ -14,13 +14,14 @@ import os
 import pickle
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Union
+from typing import Dict, List, Optional, Set, Union, Any
 from urllib.parse import urlparse
+from contextlib import asynccontextmanager
 
 import aiohttp
-import bs4
+from bs4 import BeautifulSoup
 from langchain.document_loaders import (
     WebBaseLoader, BSHTMLLoader, PyPDFLoader,
     TextLoader, GitLoader
@@ -59,7 +60,7 @@ class DocumentMetadata:
     token_count: int
     fingerprint: int
     source_type: str = "web"
-    additional_meta: Dict = None
+    additional_meta: Optional[Dict] = field(default=None)
 
 class DocumentLoadError(Exception):
     """Raised when document loading fails."""
@@ -94,8 +95,8 @@ class Collector:
             max_workers: Maximum concurrent workers
             simhash_threshold: Number of differing bits to consider documents similar
         """
-        self.session: Optional[aiohttp.ClientSession] = session
-        self.cache_dir = cache_dir
+        self.session = session
+        self.cache_dir = Path(cache_dir) if cache_dir else None
         self.default_rate_limit = rate_limit
         self.simhash_threshold = simhash_threshold
         
@@ -111,13 +112,21 @@ class Collector:
         self.document_fingerprints: Set[int] = set()
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         
+    async def __aenter__(self) -> 'Collector':
+        """Async context manager entry."""
+        await self.setup()
+        return self
+        
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any):
+        """Async context manager exit."""
+        await self.cleanup()
+        
     async def setup(self):
         """Initialize HTTP session and cache directory."""
         if self.session is None:
             self.session = aiohttp.ClientSession()
             
         if self.cache_dir:
-            self.cache_dir = Path(self.cache_dir)
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             
     async def cleanup(self):
@@ -125,13 +134,15 @@ class Collector:
         if self.session:
             await self.session.close()
             self.session = None
-        self.executor.shutdown(wait=True)
+            
+        if hasattr(self, 'executor'):
+            self.executor.shutdown(wait=True)
             
     def _get_domain(self, url: str) -> str:
         """Extract domain from URL."""
         return urlparse(url).netloc
         
-    async def _check_rate_limit(self, url: str):
+    async def _check_rate_limit(self):
         """
         Check and wait for rate limit.
         
@@ -174,21 +185,12 @@ class Collector:
             await asyncio.to_thread(self._sync_save_cache, cache_file, docs)
         except Exception as e:
             logger.warning(f"Failed to write cache for {url}: {e}")
-        """
-        Cache documents for URL.
-        """
-        if not self.cache_dir:
-    
-        def _sync_save_cache(self, cache_file: Path, docs: List[Document]):
-            import pickle
-            with open(cache_file, "wb") as f:
-                pickle.dump(docs, f)
-            return
-        cache_file = self.cache_dir / f"{hash(url)}_repo.pkl"
-        try:
-            await asyncio.to_thread(self._sync_save_cache, cache_file, docs)
-        except Exception as e:
-            logger.warning(f"Failed to write cache for {url}: {e}")
+            
+    def _sync_save_cache(self, cache_file: Path, docs: List[Document]):
+        """Synchronously save documents to cache."""
+        import pickle
+        with open(cache_file, "wb") as f:
+            pickle.dump(docs, f)
             
     def _get_loader(self, url: str) -> Union[AsyncHtmlLoader, WebBaseLoader, PyPDFLoader, TextLoader, RepoCollector]:
         """
@@ -327,7 +329,7 @@ class Collector:
             
         try:
             # Check rate limiting
-            await self._check_rate_limit(url)
+            await self._check_rate_limit()
             
             # Check cache
             if not force_reload:
@@ -407,4 +409,25 @@ class Collector:
             else:
                 logger.error(f"Batch collection error: {str(r)}")
 
-        return all_docs 
+        return all_docs
+
+    @asynccontextmanager
+    async def _rate_limited_session(self):
+        """Context manager for rate-limited session."""
+        try:
+            await self._check_rate_limit()
+            yield self.session
+        finally:
+            if self.session:
+                await self._check_rate_limit()
+
+    async def collect_with_session(
+        self,
+        url: str,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        timeout: int = DEFAULT_TIMEOUT,
+        force_reload: bool = False
+    ) -> List[Document]:
+        """Collect documents using existing session."""
+        async with self._rate_limited_session():
+            return await self.collect(url, max_tokens, timeout, force_reload) 

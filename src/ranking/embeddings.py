@@ -2,18 +2,68 @@ import mlx.core as mx
 import numpy as np
 import asyncio
 from mlx_embeddings.utils import load
-from typing import List, Union, Dict, Optional, Tuple
+from typing import List, Union, Dict, Optional, Tuple, Any
 from functools import lru_cache
 from simhash import Simhash
 import sqlite3
 from pathlib import Path
 import threading
+import logging
+from contextlib import asynccontextmanager
+from queue import Queue
+from datetime import datetime, timedelta
 
 EMBEDDING_BATCH_SIZE = 32
 MAX_TEXT_LENGTH = 512  # MLX default max length
 EMBEDDING_DIMENSION = 128  # Reduced from default 384
 SIMHASH_THRESHOLD = 3  # Number of differing bits to consider similar
 CACHE_SIZE = 10000
+
+logger = logging.getLogger(__name__)
+
+class EmbeddingError(Exception):
+    """Base class for embedding errors."""
+    pass
+
+class CacheError(EmbeddingError):
+    """Error in cache operations."""
+    pass
+
+class ModelError(EmbeddingError):
+    """Error in model operations."""
+    pass
+
+class ConnectionPool:
+    """Simple connection pool for SQLite."""
+    
+    def __init__(self, db_path: str, max_size: int = 5):
+        self.db_path = db_path
+        self.max_size = max_size
+        self._pool: Queue[sqlite3.Connection] = Queue(maxsize=max_size)
+        self._lock = threading.Lock()
+        
+    def get_connection(self) -> sqlite3.Connection:
+        """Get a connection from the pool or create new one."""
+        try:
+            return self._pool.get_nowait()
+        except:
+            return sqlite3.connect(self.db_path)
+            
+    def return_connection(self, conn: sqlite3.Connection):
+        """Return connection to pool or close if pool is full."""
+        try:
+            self._pool.put_nowait(conn)
+        except:
+            conn.close()
+            
+    def close_all(self):
+        """Close all connections in the pool."""
+        while not self._pool.empty():
+            try:
+                conn = self._pool.get_nowait()
+                conn.close()
+            except:
+                pass
 
 class EmbeddingGenerator:
     """
@@ -25,33 +75,85 @@ class EmbeddingGenerator:
         self,
         model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
         cache_dir: Optional[Path] = None,
-        embedding_batch_size: int = 32,
-        max_text_length: int = 512,
-        embedding_dimension: int = 128,
-        simhash_threshold: int = 3,
-        cache_size: int = 10000
+        embedding_batch_size: int = EMBEDDING_BATCH_SIZE,
+        max_text_length: int = MAX_TEXT_LENGTH,
+        embedding_dimension: int = EMBEDDING_DIMENSION,
+        simhash_threshold: int = SIMHASH_THRESHOLD,
+        cache_size: int = CACHE_SIZE,
+        pool_size: int = 5
     ):
-        """
-        Initialize the optimized embedding generator.
-        
-        Args:
-            model_name: Name of the model to use (must be supported by MLX)
-            cache_dir: Directory for persistent cache (optional)
-        """
-        self.model, self.tokenizer = load(model_name)
+        """Initialize the optimized embedding generator."""
+        try:
+            self.model, self.tokenizer = load(model_name)
+        except Exception as e:
+            raise ModelError(f"Failed to load model {model_name}: {str(e)}")
+            
         self.model_name = model_name
-        self.cache_dir = cache_dir
+        self.cache_dir = Path(cache_dir) if cache_dir else None
         self.embedding_batch_size = embedding_batch_size
         self.max_text_length = max_text_length
         self.embedding_dimension = embedding_dimension
         self.simhash_threshold = simhash_threshold
         self.cache_size = cache_size
         
-        if cache_dir:
-            self.cache_dir = Path(cache_dir)
+        if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             self._init_cache_db()
             self._cache_lock = threading.Lock()
+            self._pool = ConnectionPool(
+                str(self.cache_dir / "embeddings_cache.db"),
+                max_size=pool_size
+            )
+
+    async def __aenter__(self) -> 'EmbeddingGenerator':
+        """Async context manager entry."""
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any):
+        """Async context manager exit with cleanup."""
+        await self.cleanup()
+
+    async def cleanup(self):
+        """Cleanup resources."""
+        if hasattr(self, '_cache_lock'):
+            with self._cache_lock:
+                if hasattr(self, '_pool'):
+                    self._pool.close_all()
+
+    async def cleanup_cache(self, max_age_days: int = 30):
+        """Remove old cache entries."""
+        if not self.cache_dir:
+            return
+            
+        try:
+            with self._cache_lock:
+                conn = self._pool.get_connection()
+                try:
+                    with conn:
+                        conn.execute(
+                            "DELETE FROM embeddings_cache WHERE created_at < datetime('now', '-? days')",
+                            (max_age_days,)
+                        )
+                finally:
+                    self._pool.return_connection(conn)
+        except Exception as e:
+            raise CacheError(f"Cache cleanup failed: {str(e)}")
+
+    async def embed_texts_batch(
+        self,
+        texts: List[str],
+        batch_size: Optional[int] = None
+    ) -> np.ndarray:
+        """Process texts in optimized batches."""
+        batch_size = batch_size or self.embedding_batch_size
+        batches = [texts[i:i + batch_size] for i in range(0, len(texts), batch_size)]
+        
+        results = []
+        for batch in batches:
+            batch_embeddings = await self.embed_texts(batch)
+            results.append(batch_embeddings)
+        
+        return np.vstack(results)
 
     def _init_cache_db(self):
         """Initialize SQLite cache database."""
@@ -92,18 +194,22 @@ class EmbeddingGenerator:
             return None
             
         try:
-        with self._cache_lock:
-            conn = sqlite3.connect(str(self.cache_dir / "embeddings_cache.db"))
-            with conn:
-                result = conn.execute(
-                    "SELECT embedding FROM embeddings_cache WHERE text_hash = ?",
-                    (text_hash,)
-                ).fetchone()
-            conn.close()
-            if result:
-                return np.frombuffer(result[0], dtype=np.float32)
-            return None
-        except Exception:
+            with self._cache_lock:
+                conn = self._pool.get_connection()
+                try:
+                    with conn:
+                        result = conn.execute(
+                            "SELECT embedding FROM embeddings_cache WHERE text_hash = ?",
+                            (text_hash,)
+                        ).fetchone()
+                    
+                    if result:
+                        return np.frombuffer(result[0], dtype=np.float32)
+                    return None
+                finally:
+                    self._pool.return_connection(conn)
+        except Exception as e:
+            logger.error(f"Cache read failed: {str(e)}")
             return None
 
     def _cache_embedding(self, text_hash: str, fingerprint: int, embedding: np.ndarray):
@@ -113,15 +219,17 @@ class EmbeddingGenerator:
             
         try:
             with self._cache_lock:
-                conn = sqlite3.connect(str(self.cache_dir / "embeddings_cache.db"))
-                with conn:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO embeddings_cache (text_hash, fingerprint, embedding) VALUES (?, ?, ?)",
-                        (text_hash, int(fingerprint), embedding.tobytes())
-                    )
-                conn.close()
-        except Exception:
-            pass
+                conn = self._pool.get_connection()
+                try:
+                    with conn:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO embeddings_cache (text_hash, fingerprint, embedding) VALUES (?, ?, ?)",
+                            (text_hash, int(fingerprint), embedding.tobytes())
+                        )
+                finally:
+                    self._pool.return_connection(conn)
+        except Exception as e:
+            logger.error(f"Cache write failed: {str(e)}")
 
     async def _get_optimized_embedding(self, text: str) -> Tuple[int, np.ndarray]:
         """Get fingerprint and embedding with caching."""

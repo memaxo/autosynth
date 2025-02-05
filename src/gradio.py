@@ -107,12 +107,23 @@ class AppState:
         self.topic: Optional[str] = None
         self.base_path: Optional[Path] = None
         self.project: Optional[Project] = None
-        self.searcher: Optional[Search] = None
+        self.searcher: Optional[Search] = None      # Use "searcher" consistently.
         self.collector: Optional[Collector] = None
         self.processor: Optional[Processor] = None
         self.generator: Optional[ContentGenerator] = None
         self.state_db: Optional[ProjectStateDB] = None
+        # Add missing state properties:
+        self.search_results: List = []               # Holds search results
+        self.validated_docs: List = []               # Holds validated documents for generation
+        self.monitor = Monitor(project_id="autosynth-web", project_dir=Path("./"))
+        self.phi_model: Optional[PhiValidator] = None  # New property for LLM
+        self.generated_content: List = []             # New property for generated outputs
         self.logger = logging.getLogger("autosynth.gradio")
+        
+    async def cleanup(self):
+        """Cleanup resources if needed."""
+        # Implement any necessary cleanup here.
+        pass
 
     def init_project(self, project_id: str, topic: str, base_path: str = "~/.autosynth"):
         """Initialize or load a project."""
@@ -306,111 +317,109 @@ def filter_results(results: List[Dict], filters: List[str]) -> List[Dict]:
     return filtered
 
 # Interface builder functions
-def build_search_tab() -> gr.Tab:
-    """Build search tab interface."""
-    with gr.Tab("Search") as tab:
-        gr.Markdown("## Search Providers")
-        
-        with gr.Row():
-            with gr.Column(scale=3):
-                query_box = gr.Textbox(
-                    label="Search Query",
-                    placeholder="Enter your query here",
-                    lines=2
-                )
-                
-                with gr.Row():
-                    provider_selector = gr.CheckboxGroup(
-                        label="Providers",
-                        choices=SEARCH_PROVIDERS,
-                        value=["duckduckgo"],
-                        interactive=True
-                    )
-                    num_results_slider = gr.Slider(
-                        minimum=1,
-                        maximum=30,
-                        value=5,
-                        step=1,
-                        label="Number of Results"
-                    )
-            
-            with gr.Column(scale=2):
-                search_metrics = gr.JSON(
-                    label="Search Metrics",
-                    value={"status": "ready", "metrics": state.search_client.get_stats()}
-                )
-        
-        with gr.Row():
-            search_btn = gr.Button("Search", variant="primary")
-            clear_cache_btn = gr.Button("Clear Cache")
-        
-        with gr.Row():
-            with gr.Column():
-                results_table = gr.Dataframe(
-                    headers=["title", "snippet", "url", "score", "provider", "cached"],
-                    datatype=["str", "str", "str", "number", "str", "bool"],
-                    interactive=False,
-                    label="Search Results"
-                )
-            
-            with gr.Column():
-                result_filters = gr.CheckboxGroup(
-                    label="Result Filters",
-                    choices=RESULT_FILTERS,
-                    value=[]
-                )
-                
-                provider_stats = gr.Plot(label="Provider Statistics")
-        
-        # Connect components
-        async def handle_search(query, providers, n):
-            if not query.strip():
-                return {
-                    results_table: [],
-                    search_metrics: {"status": "error", "message": "Empty query provided", "metrics": {}},
-                    provider_stats: None
-                }
-            results, metrics = await search_query(query, providers, n)
-            filtered_results = filter_results(results, result_filters.value)
-            stats_plot = create_provider_stats_plot(results)
-            return {
-                results_table: filtered_results,
-                search_metrics: metrics,
-                provider_stats: stats_plot
-            }
-        
-        search_btn.click(
-            fn=handle_search,
-            inputs=[query_box, provider_selector, num_results_slider],
-            outputs=[results_table, search_metrics, provider_stats]
-        )
-        
-        # Update results when filters change
-        result_filters.change(
-            fn=lambda results, filters: filter_results(results, filters),
-            inputs=[results_table, result_filters],
-            outputs=results_table
-        )
-        
-        # Clear cache button
-        async def clear_search_cache():
-            state.search_client.vector_store.clear_all()
-            return {
-                "status": "success",
-                "message": "Cache cleared",
-                "metrics": state.search_client.get_stats()
-            }
-        
-        async def clear_search_cache_wrapper():
-            return await clear_search_cache()
-        
-        clear_cache_btn.click(
-            fn=clear_search_cache_wrapper,
-            inputs=[],
-            outputs=[search_metrics]
-        )
+def build_search_tab():
+    gr.Markdown("## Search Providers")
     
-    return tab
+    with gr.Row():
+        with gr.Column(scale=3):
+            query_box = gr.Textbox(
+                label="Search Query",
+                placeholder="Enter your query here",
+                lines=2
+            )
+            
+            with gr.Row():
+                provider_selector = gr.CheckboxGroup(
+                    label="Providers",
+                    choices=SEARCH_PROVIDERS,
+                    value=["duckduckgo"],
+                    interactive=True
+                )
+                num_results_slider = gr.Slider(
+                    minimum=1,
+                    maximum=30,
+                    value=5,
+                    step=1,
+                    label="Number of Results"
+                )
+        
+        with gr.Column(scale=2):
+            search_metrics = gr.JSON(
+                label="Search Metrics",
+                value={"status": "ready", "metrics": state.searcher.get_stats()}
+            )
+    
+    with gr.Row():
+        search_btn = gr.Button("Search", variant="primary")
+        clear_cache_btn = gr.Button("Clear Cache")
+    
+    with gr.Row():
+        with gr.Column():
+            results_table = gr.Dataframe(
+                headers=["title", "snippet", "url", "score", "provider", "cached"],
+                datatype=["str", "str", "str", "number", "str", "bool"],
+                interactive=False,
+                label="Search Results"
+            )
+        
+        with gr.Column():
+            result_filters = gr.CheckboxGroup(
+                label="Result Filters",
+                choices=RESULT_FILTERS,
+                value=[]
+            )
+            
+            provider_stats = gr.Plot(label="Provider Statistics")
+    
+    # Connect components
+    async def handle_search(query, providers, n):
+        if not query.strip():
+            return {
+                results_table: [],
+                search_metrics: {"status": "error", "message": "Empty query provided", "metrics": {}},
+                provider_stats: None
+            }
+        results, metrics = await search_query(query, providers, n)
+        filtered_results = filter_results(results, result_filters.value)
+        stats_plot = create_provider_stats_plot(results)
+        return {
+            results_table: filtered_results,
+            search_metrics: metrics,
+            provider_stats: stats_plot
+        }
+    
+    search_btn.click(
+        fn=handle_search,
+        inputs=[query_box, provider_selector, num_results_slider],
+        outputs=[results_table, search_metrics, provider_stats]
+    )
+    
+    # Update results when filters change
+    result_filters.change(
+        fn=lambda results, filters: filter_results(results, filters),
+        inputs=[results_table, result_filters],
+        outputs=results_table
+    )
+    
+    # Clear cache button
+    async def clear_search_cache():
+        state.searcher.vector_store.clear_all()
+        return {
+            "status": "success",
+            "message": "Cache cleared",
+            "metrics": state.searcher.get_stats()
+        }
+    
+    async def clear_search_cache_wrapper():
+        return await clear_search_cache()
+    
+    clear_cache_btn.click(
+        fn=clear_search_cache_wrapper,
+        inputs=[],
+        outputs=[search_metrics]
+    )
+    
+    return gr.Tab("Search")
 
 # Additional visualization helpers
 def create_validation_plots(validation_status: Dict[str, Any]) -> Tuple[go.Figure, go.Figure, go.Figure]:
@@ -488,7 +497,7 @@ def create_progress_plots() -> Tuple[go.Figure, go.Figure]:
     return progress_fig, metrics_fig
 
 # Processing functionality
-async def collect_documents(state: AppState, urls: str, progress=gr.Progress()):
+async def collect_documents(urls: str, batch_size: int, max_concurrent: int, timeout: int, retries: int, progress=gr.Progress()) -> Tuple[str, Dict]:
     """Collect documents from provided URLs."""
     if not state.collector:
         return "Error: Project not initialized", {}
@@ -506,7 +515,7 @@ async def collect_documents(state: AppState, urls: str, progress=gr.Progress()):
                 docs = await state.collector.collect_batch(
                     url,
                     max_tokens=2000,
-                    timeout=30
+                    timeout=timeout
                 )
                 collected_docs.extend(docs)
             except Exception as e:
@@ -521,10 +530,10 @@ async def collect_documents(state: AppState, urls: str, progress=gr.Progress()):
                 "source_type": "web",
                 "tokens": len(doc.page_content.split())
             }
-            state.state_db.add_collected_doc(state.project_id, doc_dict)
+            await state.state_db.add_collected_doc(state.project_id, doc_dict)
             
         # Get updated counts
-        doc_count = state.state_db.get_doc_count(state.project_id, "collected")
+        doc_count = await state.state_db.get_doc_count(state.project_id, "collected")
         token_count = sum(len(doc.page_content.split()) for doc in collected_docs)
             
         return (
@@ -539,25 +548,22 @@ async def collect_documents(state: AppState, urls: str, progress=gr.Progress()):
         state.logger.error(f"Error in document collection: {str(e)}")
         return f"Error: {str(e)}", {}
 
-async def process_documents(state: AppState, batch_size: int = 10, progress=gr.Progress()):
+async def process_documents(topic: str, batch_size: int, max_concurrent: int, timeout: int) -> Tuple[str, Dict, Any]:
     """Process collected documents."""
     if not state.processor:
-        return "Error: Project not initialized", {}
+        return "Error: Project not initialized", {}, None
         
     try:
         # Get collected documents
-        collected_docs = state.state_db.get_collected_docs(state.project_id)
+        collected_docs = await state.state_db.get_collected_docs(state.project_id)
         if not collected_docs:
-            return "Error: No documents to process", {}
+            return "Error: No documents to process", {}, None
             
         processed_count = 0
         total_chunks = 0
         
         # Process in batches
-        for i in progress.tqdm(
-            range(0, len(collected_docs), batch_size),
-            desc="Processing documents"
-        ):
+        for i in range(0, len(collected_docs), batch_size):
             batch = collected_docs[i:i + batch_size]
             
             for doc_dict in batch:
@@ -573,12 +579,12 @@ async def process_documents(state: AppState, batch_size: int = 10, progress=gr.P
                         chunk_overlap=200
                     )
                     
-                    if await state.processor.verify_quality(clean_doc, state.topic):
+                    if await state.processor.verify_quality(clean_doc, topic):
                         processed_dict = {
                             "content": clean_doc.page_content,
                             "metadata": clean_doc.metadata
                         }
-                        state.state_db.add_processed_doc(state.project_id, processed_dict)
+                        await state.state_db.add_processed_doc(state.project_id, processed_dict)
                         processed_count += 1
                         total_chunks += len(clean_doc.page_content.split())
                         
@@ -586,17 +592,25 @@ async def process_documents(state: AppState, batch_size: int = 10, progress=gr.P
                     state.logger.error(f"Error processing document: {str(e)}")
                     continue
                     
+        validation_stats = create_validation_plots({
+            "details": {
+                "documents_processed": processed_count,
+                "chunks_created": total_chunks
+            }
+        })
+                    
         return (
             f"Processed {processed_count} documents",
             {
                 "documents_processed": processed_count,
                 "chunks_created": total_chunks
-            }
+            },
+            validation_stats
         )
             
     except Exception as e:
         state.logger.error(f"Error in document processing: {str(e)}")
-        return f"Error: {str(e)}", {}
+        return f"Error: {str(e)}", {}, None
 
 # Generation functionality
 async def generate_content(doc_index: int, prompt: str, temperature: float) -> str:
@@ -661,324 +675,310 @@ def get_progress_metrics() -> Dict[str, Any]:
     metrics["current_metrics"] = state.monitor.stage_metrics[current_stage]
     return metrics
 
-def build_ranking_tab() -> gr.Tab:
-    """Build ranking tab interface."""
-    with gr.Tab("Ranking") as tab:
-        gr.Markdown("## Re-Rank Results")
-        gr.Markdown("Select result rows from the Search tab to re-rank them with new weights.")
-        
-        with gr.Row():
-            with gr.Column():
-                selected_indices = gr.Textbox(
-                    label="Indices (comma-separated)",
-                    placeholder="e.g. 0,1,2"
-                )
-                semantic_slider = gr.Slider(
-                    minimum=0,
-                    maximum=1.0,
-                    step=0.1,
-                    value=0.4,
-                    label="Semantic Weight"
-                )
-                domain_slider = gr.Slider(
-                    minimum=0,
-                    maximum=1.0,
-                    step=0.1,
-                    value=0.3,
-                    label="Domain Weight"
-                )
-            
-            with gr.Column():
-                ranked_table = gr.Dataframe(
-                    headers=["title", "snippet", "url", "score"],
-                    datatype=["str", "str", "str", "number"],
-                    interactive=False,
-                    label="Re-Ranked Results"
-                )
-        
-        re_rank_btn = gr.Button("Re-Rank")
-        
-        def rerank_results(indices_str: str, semantic_weight: float, domain_weight: float) -> List[Dict]:
-            """Re-rank selected search results."""
-            if not indices_str.strip() or not state.search_results:
-                return []
-            
-            # Parse indices
-            try:
-                indices = [int(x.strip()) for x in indices_str.split(",") if x.strip().isdigit()]
-            except ValueError:
-                return []
-            
-            # Get selected results
-            subset = [state.search_results[i] for i in indices if i < len(state.search_results)]
-            
-            # Apply weights
-            for res in subset:
-                res["score"] = (
-                    res["score"] * semantic_weight +
-                    (0.1 * domain_weight if any(d in res["url"] for d in ACADEMIC_DOMAINS) else 0)
-                )
-            
-            # Sort by score
-            subset.sort(key=lambda x: x["score"], reverse=True)
-            return subset
-        
-        re_rank_btn.click(
-            fn=rerank_results,
-            inputs=[selected_indices, semantic_slider, domain_slider],
-            outputs=ranked_table
-        )
+def build_ranking_tab():
+    gr.Markdown("## Re-Rank Results")
+    gr.Markdown("Select result rows from the Search tab to re-rank them with new weights.")
     
-    return tab
-
-def build_processing_tab() -> gr.Tab:
-    """Build processing tab interface."""
-    with gr.Tab("Processing") as tab:
-        gr.Markdown("## Document Collection & Validation")
-        
-        # Batch processing controls
-        with gr.Row():
-            with gr.Column():
-                batch_size = gr.Slider(
-                    minimum=1,
-                    maximum=20,
-                    value=5,
-                    step=1,
-                    label="Batch Size"
-                )
-                max_concurrent = gr.Slider(
-                    minimum=1,
-                    maximum=10,
-                    value=3,
-                    step=1,
-                    label="Max Concurrent Batches"
-                )
-            
-            with gr.Column():
-                processing_timeout = gr.Number(
-                    value=30,
-                    label="Processing Timeout (seconds)"
-                )
-                retry_attempts = gr.Slider(
-                    minimum=0,
-                    maximum=3,
-                    value=1,
-                    step=1,
-                    label="Retry Attempts"
-                )
-        
-        # Collection components
-        with gr.Row():
-            with gr.Column():
-                url_input = gr.Textbox(
-                    label="URLs (one per line)",
-                    lines=5,
-                    placeholder="Enter URLs to collect from..."
-                )
-                file_upload = gr.File(
-                    label="Upload Documents",
-                    file_types=SUPPORTED_FILE_TYPES,
-                    multiple=True
-                )
-            
-            with gr.Column():
-                topic_input = gr.Textbox(
-                    label="Topic (for validation)",
-                    placeholder="Enter topic for content validation..."
-                )
-        
-        # Add filtering controls
-        with gr.Row():
-            gr.Dropdown(
-                choices=VALIDITY_FILTERS,
-                value="All",
-                label="Validity Filter",
-                interactive=True
+    with gr.Row():
+        with gr.Column():
+            selected_indices = gr.Textbox(
+                label="Indices (comma-separated)",
+                placeholder="e.g. 0,1,2"
             )
-            gr.Dropdown(
-                choices=CONTENT_TYPES,
-                value="All",
-                label="Content Type",
-                interactive=True
-            )
-            gr.Dropdown(
-                choices=SOURCE_TYPES,
-                value="All",
-                label="Source Type",
-                interactive=True
-            )
-            gr.Slider(
-                minimum=0.0,
+            semantic_slider = gr.Slider(
+                minimum=0,
                 maximum=1.0,
-                value=0.0,
                 step=0.1,
-                label="Minimum Quality Score",
-                interactive=True
+                value=0.4,
+                label="Semantic Weight"
             )
+            domain_slider = gr.Slider(
+                minimum=0,
+                maximum=1.0,
+                step=0.1,
+                value=0.3,
+                label="Domain Weight"
+            )
+        
+        with gr.Column():
+            ranked_table = gr.Dataframe(
+                headers=["title", "snippet", "url", "score"],
+                datatype=["str", "str", "str", "number"],
+                interactive=False,
+                label="Re-Ranked Results"
+            )
+    
+    re_rank_btn = gr.Button("Re-Rank")
+    
+    def rerank_results(indices_str: str, semantic_weight: float, domain_weight: float) -> List[Dict]:
+        """Re-rank selected search results."""
+        if not indices_str.strip() or not state.search_results:
+            return []
+        
+        # Parse indices
+        try:
+            indices = [int(x.strip()) for x in indices_str.split(",") if x.strip().isdigit()]
+        except ValueError:
+            return []
+        
+        # Get selected results
+        subset = [state.search_results[i] for i in indices if i < len(state.search_results)]
+        
+        # Apply weights
+        for res in subset:
+            res["score"] = (
+                res["score"] * semantic_weight +
+                (0.1 * domain_weight if any(d in res["url"] for d in ACADEMIC_DOMAINS) else 0)
+            )
+        
+        # Sort by score
+        subset.sort(key=lambda x: x["score"], reverse=True)
+        return subset
+    
+    re_rank_btn.click(
+        fn=rerank_results,
+        inputs=[selected_indices, semantic_slider, domain_slider],
+        outputs=ranked_table
+    )
+    
+    return gr.Tab("Ranking")
 
-        # Add progress visualization
-        with gr.Row():
-            gr.Plot(
-                label="Processing Progress",
-                value=create_progress_plots()[0]
+def build_processing_tab():
+    gr.Markdown("## Document Collection & Validation")
+    
+    # Batch processing controls
+    with gr.Row():
+        with gr.Column():
+            batch_size = gr.Slider(
+                minimum=1,
+                maximum=20,
+                value=5,
+                step=1,
+                label="Batch Size"
             )
-            gr.Plot(
-                label="Validation Statistics",
-                value=create_progress_plots()[1]
+            max_concurrent = gr.Slider(
+                minimum=1,
+                maximum=10,
+                value=3,
+                step=1,
+                label="Max Concurrent Batches"
             )
         
-        # Results table
-        results_table = gr.DataFrame(
-            headers=[
-                "doc_id", "file_name", "is_valid",
-                "content_type", "validation_reason",
-                "quality_score", "source_type"
-            ],
-            label="Validation Results"
+        with gr.Column():
+            processing_timeout = gr.Number(
+                value=30,
+                label="Processing Timeout (seconds)"
+            )
+            retry_attempts = gr.Slider(
+                minimum=0,
+                maximum=3,
+                value=1,
+                step=1,
+                label="Retry Attempts"
+            )
+    
+    # Collection components
+    with gr.Row():
+        with gr.Column():
+            url_input = gr.Textbox(
+                label="URLs (one per line)",
+                lines=5,
+                placeholder="Enter URLs to collect from..."
+            )
+        
+        with gr.Column():
+            topic_input = gr.Textbox(
+                label="Topic (for validation)",
+                placeholder="Enter topic for content validation..."
+            )
+    
+    # Add filtering controls
+    with gr.Row():
+        gr.Dropdown(
+            choices=VALIDITY_FILTERS,
+            value="All",
+            label="Validity Filter",
+            interactive=True
         )
-        
-        # Action buttons
-        with gr.Row():
-            collect_btn = gr.Button("Collect Documents")
-            validate_btn = gr.Button("Validate Documents")
-        
-        # Status display
-        with gr.Row():
-            with gr.Column():
-                collection_status = gr.JSON(
-                    label="Collection Status",
-                    visible=True
-                )
-                validation_status = gr.JSON(
-                    label="Validation Status",
-                    visible=True
-                )
-            
-            with gr.Column():
-                stats_plot = gr.Plot(label="Validation Statistics")
-        
-        # Connect components
-        collect_btn.click(
-            fn=collect_documents,
-            inputs=[
-                file_upload,
-                url_input,
-                batch_size,
-                max_concurrent,
-                processing_timeout,
-                retry_attempts
-            ],
-            outputs=[collection_status]
+        gr.Dropdown(
+            choices=CONTENT_TYPES,
+            value="All",
+            label="Content Type",
+            interactive=True
         )
-        
-        validate_btn.click(
-            fn=process_documents,
-            inputs=[
-                topic_input,
-                batch_size,
-                max_concurrent,
-                processing_timeout
-            ],
-            outputs=[
-                validation_status,
-                results_table,
-                stats_plot
-            ]
+        gr.Dropdown(
+            choices=SOURCE_TYPES,
+            value="All",
+            label="Source Type",
+            interactive=True
+        )
+        gr.Slider(
+            minimum=0.0,
+            maximum=1.0,
+            value=0.0,
+            step=0.1,
+            label="Minimum Quality Score",
+            interactive=True
+        )
+
+    # Add progress visualization
+    with gr.Row():
+        gr.Plot(
+            label="Processing Progress",
+            value=create_progress_plots()[0]
+        )
+        gr.Plot(
+            label="Validation Statistics",
+            value=create_progress_plots()[1]
         )
     
-    return tab
-
-def build_generation_tab() -> gr.Tab:
-    """Build generation tab interface."""
-    with gr.Tab("Generation") as tab:
-        gr.Markdown("## Content Generation")
-        
-        with gr.Row():
-            with gr.Column():
-                doc_index = gr.Number(
-                    label="Validated Document Index",
-                    value=0
-                )
-                prompt_box = gr.Textbox(
-                    label="Generation Prompt",
-                    lines=3,
-                    placeholder="E.g. Summarize the key points..."
-                )
-                temp_slider = gr.Slider(
-                    minimum=0,
-                    maximum=1.0,
-                    value=0.7,
-                    label="Temperature"
-                )
-            
-            with gr.Column():
-                gen_output = gr.Textbox(
-                    label="Generated Variation",
-                    lines=10,
-                    interactive=False
-                )
-        
-        generate_btn = gr.Button("Generate")
-        
-        async def generate_content_wrapper(idx: int, prompt: str, temp: float) -> str:
-            return await generate_content(idx, prompt, temp)
-        
-        generate_btn.click(
-            fn=generate_content_wrapper,
-            inputs=[doc_index, prompt_box, temp_slider],
-            outputs=gen_output
-        )
+    # Results table
+    results_table = gr.DataFrame(
+        headers=[
+            "doc_id", "file_name", "is_valid",
+            "content_type", "validation_reason",
+            "quality_score", "source_type"
+        ],
+        label="Validation Results"
+    )
     
-    return tab
+    # Action buttons
+    with gr.Row():
+        collect_btn = gr.Button("Collect Documents")
+        validate_btn = gr.Button("Validate Documents")
+    
+    # Status display
+    with gr.Row():
+        with gr.Column():
+            collection_status = gr.JSON(
+                label="Collection Status",
+                visible=True
+            )
+            validation_status = gr.JSON(
+                label="Validation Status",
+                visible=True
+            )
+        
+        with gr.Column():
+            stats_plot = gr.Plot(label="Validation Statistics")
+    
+    # Connect components
+    collect_btn.click(
+        fn=collect_documents,
+        inputs=[
+            url_input,
+            batch_size,
+            max_concurrent,
+            processing_timeout,
+            retry_attempts
+        ],
+        outputs=[collection_status]
+    )
+    
+    validate_btn.click(
+        fn=process_documents,
+        inputs=[
+            topic_input,
+            batch_size,
+            max_concurrent,
+            processing_timeout
+        ],
+        outputs=[
+            validation_status,
+            results_table,
+            stats_plot
+        ]
+    )
+    
+    return gr.Tab("Processing")
 
-def build_monitoring_tab() -> gr.Tab:
-    """Build monitoring tab interface."""
-    with gr.Tab("Monitoring") as tab:
-        gr.Markdown("## Pipeline Monitor")
+def build_generation_tab():
+    gr.Markdown("## Content Generation")
         
-        with gr.Row():
-            # Pipeline progress
-            with gr.Column():
-                progress_plot = gr.Plot(label="Pipeline Progress")
-                metrics_plot = gr.Plot(label="Current Stage Metrics")
-            
-            # Stage details
-            with gr.Column():
-                stage_metrics = gr.JSON(
-                    label="Stage Metrics",
-                    value=get_progress_metrics()
-                )
+    with gr.Row():
+        with gr.Column():
+            doc_index = gr.Number(
+                label="Validated Document Index",
+                value=0
+            )
+            prompt_box = gr.Textbox(
+                label="Generation Prompt",
+                lines=3,
+                placeholder="E.g. Summarize the key points..."
+            )
+            temp_slider = gr.Slider(
+                minimum=0,
+                maximum=1.0,
+                value=0.7,
+                label="Temperature"
+            )
         
-        with gr.Row():
-            # Recent logs
-            logs_box = gr.Textbox(
-                label="Recent Logs",
-                value=get_pipeline_logs(),
+        with gr.Column():
+            gen_output = gr.Textbox(
+                label="Generated Variation",
                 lines=10,
                 interactive=False
             )
+    
+    generate_btn = gr.Button("Generate")
+    
+    async def generate_content_wrapper(idx: int, prompt: str, temp: float) -> str:
+        return await generate_content(idx, prompt, temp)
+    
+    generate_btn.click(
+        fn=generate_content_wrapper,
+        inputs=[doc_index, prompt_box, temp_slider],
+        outputs=gen_output
+    )
+    
+    return gr.Tab("Generation")
+
+def build_monitoring_tab():
+    gr.Markdown("## Pipeline Monitor")
         
-        # Auto-refresh components
-        def update_monitoring():
-            """Update monitoring components."""
-            metrics = get_progress_metrics()
-            logs = get_pipeline_logs()
-            progress_fig, metrics_fig = create_progress_plots()
-            return {
-                progress_plot: progress_fig,
-                metrics_plot: metrics_fig,
-                stage_metrics: metrics,
-                logs_box: logs
-            }
+    with gr.Row():
+        # Pipeline progress
+        with gr.Column():
+            progress_plot = gr.Plot(label="Pipeline Progress")
+            metrics_plot = gr.Plot(label="Current Stage Metrics")
         
-        gr.on(
-            fn=update_monitoring,
-            inputs=None,
-            outputs=[progress_plot, metrics_plot, stage_metrics, logs_box],
-            every=2  # Update every 2 seconds
+        # Stage details
+        with gr.Column():
+            stage_metrics = gr.JSON(
+                label="Stage Metrics",
+                value=get_progress_metrics()
+            )
+    
+    with gr.Row():
+        # Recent logs
+        logs_box = gr.Textbox(
+            label="Recent Logs",
+            value=get_pipeline_logs(),
+            lines=10,
+            interactive=False
         )
     
-    return tab
+    # Auto-refresh components
+    def update_monitoring():
+        """Update monitoring components."""
+        metrics = get_progress_metrics()
+        logs = get_pipeline_logs()
+        progress_fig, metrics_fig = create_progress_plots()
+        return {
+            progress_plot: progress_fig,
+            metrics_plot: metrics_fig,
+            stage_metrics: metrics,
+            logs_box: logs
+        }
+    
+    refresh_btn = gr.Button("Refresh Monitor")
+    refresh_btn.click(
+        fn=update_monitoring,
+        inputs=[],
+        outputs=[progress_plot, metrics_plot, stage_metrics, logs_box]
+    )
+    
+    return gr.Tab("Monitoring")
 
 def build_interface() -> gr.Blocks:
     """Build complete Gradio interface."""
@@ -987,29 +987,26 @@ def build_interface() -> gr.Blocks:
         gr.Markdown("An AI-powered document synthesis and content generation pipeline.")
         
         # Create tabs container
-        tabs = gr.Tabs(selected=0)  # Start with first tab selected
-        
-        # Add all tabs within the container
-        with tabs:
+        with gr.Tabs() as tabs:  # Remove selected=0 as it's the default
             # Search tab for discovering and collecting documents
-            with gr.TabItem("Search"):
-                build_search_tab()
+            search_tab = build_search_tab()
+            tabs.add_tab("Search", search_tab)
             
             # Ranking tab for re-ranking and filtering results
-            with gr.TabItem("Ranking"):
-                build_ranking_tab()
+            ranking_tab = build_ranking_tab()
+            tabs.add_tab("Ranking", ranking_tab)
             
             # Processing tab for document validation and analysis
-            with gr.TabItem("Processing"):
-                build_processing_tab()
+            processing_tab = build_processing_tab()
+            tabs.add_tab("Processing", processing_tab)
             
             # Generation tab for content synthesis
-            with gr.TabItem("Generation"):
-                build_generation_tab()
+            generation_tab = build_generation_tab()
+            tabs.add_tab("Generation", generation_tab)
             
             # Monitoring tab for pipeline progress and metrics
-            with gr.TabItem("Monitoring"):
-                build_monitoring_tab()
+            monitoring_tab = build_monitoring_tab()
+            tabs.add_tab("Monitoring", monitoring_tab)
         
         # Add footer with version and status
         with gr.Row():
@@ -1021,7 +1018,7 @@ def build_interface() -> gr.Blocks:
         
         # Update status indicator based on state
         def update_status():
-            if state.initialized:
+            if state.project is not None:
                 return "Running"
             return "Ready"
         
@@ -1089,4 +1086,15 @@ def main():
     )
 
 if __name__ == "__main__":
+    # Initialize global state components if not already set
+    if state.searcher is None:
+        from .di import create_search
+        state.searcher = create_search()
+    if state.phi_model is None:
+        # Initialize phi_model using default model path and parameters
+        from .model import PhiValidator
+        state.phi_model = PhiValidator(model_path=DEFAULT_MODEL_PATH, max_tokens=1000, temperature=0.1)
+    if state.monitor is None:
+        from .di import create_monitor
+        state.monitor = create_monitor()
     main()

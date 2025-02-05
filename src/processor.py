@@ -7,6 +7,7 @@ using the unified DocumentValidator.
 
 import logging
 import re
+import asyncio
 from typing import Dict, List, Optional, Tuple
 from langchain.schema import Document
 from .validator import DocumentValidator
@@ -17,6 +18,10 @@ DEFAULT_CHUNK_OVERLAP = 200
 DEFAULT_MIN_QUALITY = 0.7
 
 logger = logging.getLogger(__name__)
+
+class ProcessingError(Exception):
+    """Base class for processing errors."""
+    pass
 
 class Processor:
     """
@@ -127,29 +132,33 @@ class Processor:
                 return self._chunk_document(clean_doc)
                 
             return clean_doc
-    
-        async def _process_single_document(
-            self,
-            doc: Document,
-            chunk_size: Optional[int] = None,
-            chunk_overlap: Optional[int] = None
-        ) -> Optional[Document]:
-            """
-            Process a single document by cleaning and chunking it.
             
-            Returns:
-                Cleaned document, a list of chunks, or None if an error occurs.
-            """
-            try:
-                return await self.clean_content(doc, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-            except Exception as e:
-                logger.error(f"Error cleaning document: {e}")
-                return None
+        except Exception as e:
+            logger.error(f"Error cleaning document: {str(e)}")
+            raise ProcessingError(f"Failed to clean document: {str(e)}")
             
         finally:
             # Restore original settings
             self.chunk_size = orig_size
             self.chunk_overlap = orig_overlap
+            
+    async def _process_single_document(
+        self,
+        doc: Document,
+        chunk_size: Optional[int] = None,
+        chunk_overlap: Optional[int] = None
+    ) -> Optional[Document]:
+        """
+        Process a single document by cleaning and chunking it.
+        
+        Returns:
+            Cleaned document, a list of chunks, or None if an error occurs.
+        """
+        try:
+            return await self.clean_content(doc, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        except Exception as e:
+            logger.error(f"Error cleaning document: {e}")
+            return None
             
     async def verify_quality(
         self,
